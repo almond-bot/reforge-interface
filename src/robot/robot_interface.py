@@ -424,6 +424,16 @@ class RobotInterface(ArmClient):
         arm.set_arm_modes(trossen_arm.Mode.position)
         return 0
 
+    def stop_motion(self) -> None:
+        """Exit position control using the Trossen controller's idle mode.
+
+        The installed controller's braking behavior must be verified by the
+        operator before backlash capture. Physical emergency stop remains the
+        immediate hazard response.
+        """
+        arm = self._require_connected_arm()
+        arm.set_arm_modes(trossen_arm.Mode.idle)
+
     def supports_teaching_mode(self) -> bool:
         """Return whether the Trossen backend can enable manual teaching mode.
 

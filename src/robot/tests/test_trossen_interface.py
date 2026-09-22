@@ -80,6 +80,15 @@ def test_joint_commands_use_trossen_position_api() -> None:
     assert interface.robot.calls[1][1] == ([1.0] * 6, 0.0, False)
 
 
+def test_stop_motion_exits_position_control() -> None:
+    """The calibration stop hook requests the controller's idle mode."""
+    interface = make_interface()
+
+    interface.stop_motion()
+
+    assert interface.robot.calls == [("mode", (trossen_arm.Mode.idle,))]
+
+
 def test_teach_mode_uses_zero_external_effort_then_brakes() -> None:
     interface = make_interface()
 
