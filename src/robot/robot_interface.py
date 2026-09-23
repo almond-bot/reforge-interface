@@ -200,17 +200,7 @@ class RobotInterface(ArmClient):
         self.reforge_api_token = api_token
         try:
             # {~.~} Instantiate live robot mode
-            if USE_LEFT:
-                self.robot = Axol(right_channel=None)
-            else:
-                self.robot = Axol(left_channel=None)  # [CHANGE THIS LINE]
 
-            await self.robot.start_telemetry(ROBOT_MAX_FREQ)
-            await self.robot.wait_for_telemetry()
-            
-            print("Connected to Axol robot!")
-            print("left positions (rad):", axol.left.positions)
-            print("left torques (Nm):", axol.left.torques)
             # ------------------- EXAMPLE --------------------
             # self.robot = StandardBotsRobot(
             #     url=robot_ip,
@@ -273,6 +263,10 @@ class RobotInterface(ArmClient):
                 imu_record_frequency_hz=imu_record_frequency_hz,
                 imu_recorder=selected_imu_recorder,
             )
+
+    # {~.~} Add any necessary machinery for asynchronous operation below until the next {~.~} marker 
+    
+    # {~.~} All infrastructure for asynchronous operation should be above this line. 
 
     def create_robot_imu_recorder(self) -> ImuRecorder:
         """Create the robot-native IMU adapter used when Reforge IMU is disabled.
