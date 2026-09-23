@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Literal, Optional, Sequence
 
 import numpy as np
+from almond_axol.robot import Axol
 
 from reforge_core.hw_interfaces.arm_client import ArmClient
 from reforge_core.hw_interfaces.imu_recorder import ImuRecorder
@@ -46,17 +47,24 @@ URDF_PATH = "urdf/axol-left.urdf"  # {~.~} [CHANGE TO YOUR ROBOT'S URDF FILE PAT
 JOINTS_TARGETED = [0, 7] # for slicing joint array, e.g. q[JOINTS_TARGETED[0] : JOINTS_TARGETED[1]]
 
 # Fully stretched position of the robot for calibration.
-FULL_STRETCH_XYZ = [1.28989, 0.36866, 0.171]  # {~.~} [m]
-FULL_STRETCH_QUAT = [0.499, 0.499, 0.499, 0.499]  # {~.~} [1]
-FULL_STRETCH_JOINTS = [0.0, np.pi / 2, 0.0, 0.0, 0.0, 0.0]  # {~.~} [rad]
+FULL_STRETCH_XYZ = [0.781526, 0.0, 0.0]  # {~.~} [m]
+FULL_STRETCH_QUAT = [0.0, -0.7071067812, 0.0, 0.7071067812]  # {~.~} [1]
+FULL_STRETCH_JOINTS = [0.0, -np.pi / 2, 0.0, 0.0, 0.0, 0.0, 0.0]  # {~.~} [rad]
 DEFAULT_TCP_PAYLOAD = 0.0  # {~.~} [CHANGE IF THE DEFAULT PAYLOAD IS NON_ZERO]
 
 # ========== RIGHT ARM PARAMETERS ===========
+BOT_ID = ""  if not USE_LEFT else BOT_ID # {~.~} [CHANGE TO ROBOT's ID, IF NECESSARY] - can also enter as CLI argument (see run.py --help)
+URDF_PATH = "urdf/axol-right.urdf" if not USE_LEFT else URDF_PATH  # {~.~} [CHANGE TO YOUR ROBOT'S URDF FILE PATH]
+JOINTS_TARGETED = [7, 14] if not USE_LEFT else URDF_PATH # for slicing joint array, e.g. q[JOINTS_TARGETED[0] : JOINTS_TARGETED[1]]
+
 # EXAMPLE: use ternary operators so change up top and cascades. These are loaded if file ran as a module.
-FULL_STRETCH_XYZ = [-1.28989, -0.36866, 0.171] if not USE_LEFT else FULL_STRETCH_XYZ  
+FULL_STRETCH_XYZ = [-0.781526, 0.0, 0.0] if not USE_LEFT else FULL_STRETCH_XYZ  # {~.~} [m]
+FULL_STRETCH_QUAT = [0.0, 0.7071067812, 0.0, 0.7071067812]  if not USE_LEFT else FULL_STRETCH_QUAT # {~.~} [1]
+FULL_STRETCH_JOINTS = [0.0, np.pi / 2, 0.0, 0.0, 0.0, 0.0, 0.0] if not USE_LEFT else FULL_STRETCH_JOINTS  # {~.~} [rad]
+DEFAULT_TCP_PAYLOAD = 0.0 if not USE_LEFT else DEFAULT_TCP_PAYLOAD # {~.~} [CHANGE IF THE DEFAULT PAYLOAD IS NON_ZERO]
 
 # ========== COMMON PARAMETERS ==============
-ROBOT_MAX_FREQ = 250  # {~.~} [CHANGE TO ROBOT'S MAX SAMPLING FREQUENCY] in [Hz]
+ROBOT_MAX_FREQ = 240  # {~.~} [CHANGE TO ROBOT'S MAX SAMPLING FREQUENCY] in [Hz]
 FULL_STRETCH_POSE_OVERRIDE = None  # {~.~} list of home pose (xyz and quaternion) to override additional height not in base height
 
 # General constants
@@ -192,8 +200,17 @@ class RobotInterface(ArmClient):
         self.reforge_api_token = api_token
         try:
             # {~.~} Instantiate live robot mode
-            self.robot = None  # [CHANGE THIS LINE]
+            if USE_LEFT:
+                self.robot = Axol(right_channel=None)
+            else:
+                self.robot = Axol(left_channel=None)  # [CHANGE THIS LINE]
 
+            await self.robot.start_telemetry(ROBOT_MAX_FREQ)
+            await self.robot.wait_for_telemetry()
+            
+            print("Connected to Axol robot!")
+            print("left positions (rad):", axol.left.positions)
+            print("left torques (Nm):", axol.left.torques)
             # ------------------- EXAMPLE --------------------
             # self.robot = StandardBotsRobot(
             #     url=robot_ip,
@@ -447,7 +464,7 @@ class RobotInterface(ArmClient):
         # ----------------------------------------------------------------------
 
         # {~.~} Return 0 for success - edit after implementation and testing
-        return 1
+        return 0
 
     def enter_servo_mode(self) -> Optional[int | None]:
         """Ensure the controller is set to servo control mode.
@@ -464,7 +481,7 @@ class RobotInterface(ArmClient):
         # ----------------------------------------------------------------------
 
         # {~.~} Return 0 for success - edit after implementation and testing
-        return 1
+        return 0
 
     def supports_teaching_mode(self) -> bool:
         """Return whether the robot supports manual teaching mode.
@@ -474,7 +491,7 @@ class RobotInterface(ArmClient):
         Returns:
             `bool` indicating whether manual teaching mode is implemented.
         """
-        return False
+        return True
 
     def enter_teaching_mode(self) -> Optional[int | None]:
         """Ensure the controller is set to manual teaching mode.
@@ -488,6 +505,7 @@ class RobotInterface(ArmClient):
 
         # {~.~} Enable manual teaching mode using the robot SDK.
         # [YOUR CODE HERE]
+        arm.robot.gravity.GravityCompensator
 
         # {~.~} Return 0 for success - edit after implementation and testing
         return 1
