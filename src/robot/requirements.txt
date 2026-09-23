@@ -2,3 +2,5 @@ mcap-protobuf-support>=0.5,<0.6
 numpy>=2,<3
 pydantic
 reforge-core[all]
+almond-axol==0.2.5
+almond-axol[sim]==0.2.5

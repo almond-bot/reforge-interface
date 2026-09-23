@@ -35,23 +35,34 @@ from reforge_core.hw_interfaces.imu_recorder import ImuRecorder
 # https://docs.standardbots.com/docs/latest/-/rest/intro/configuring-sdk
 # -----------------------------------------------------------------------
 
-
 # User constants - EDITS REQUIRED
+
+# ========== BIMANUAL SPECIFIC ==============
+USE_LEFT = True
+
+# ========== LEFT ARM PARAMETERS ============
 BOT_ID = ""  # {~.~} [CHANGE TO ROBOT's ID, IF NECESSARY] - can also enter as CLI argument (see run.py --help)
-URDF_PATH = "urdf/test_robot.urdf"  # {~.~} [CHANGE TO YOUR ROBOT'S URDF FILE PATH]
-ROBOT_MAX_FREQ = 250  # {~.~} [CHANGE TO ROBOT'S MAX SAMPLING FREQUENCY] in [Hz]
+URDF_PATH = "urdf/axol-left.urdf"  # {~.~} [CHANGE TO YOUR ROBOT'S URDF FILE PATH]
+JOINTS_TARGETED = [0, 7] # for slicing joint array, e.g. q[JOINTS_TARGETED[0] : JOINTS_TARGETED[1]]
 
 # Fully stretched position of the robot for calibration.
 FULL_STRETCH_XYZ = [1.28989, 0.36866, 0.171]  # {~.~} [m]
 FULL_STRETCH_QUAT = [0.499, 0.499, 0.499, 0.499]  # {~.~} [1]
 FULL_STRETCH_JOINTS = [0.0, np.pi / 2, 0.0, 0.0, 0.0, 0.0]  # {~.~} [rad]
+DEFAULT_TCP_PAYLOAD = 0.0  # {~.~} [CHANGE IF THE DEFAULT PAYLOAD IS NON_ZERO]
+
+# ========== RIGHT ARM PARAMETERS ===========
+# EXAMPLE: use ternary operators so change up top and cascades. These are loaded if file ran as a module.
+FULL_STRETCH_XYZ = [-1.28989, -0.36866, 0.171] if not USE_LEFT else FULL_STRETCH_XYZ  
+
+# ========== COMMON PARAMETERS ==============
+ROBOT_MAX_FREQ = 250  # {~.~} [CHANGE TO ROBOT'S MAX SAMPLING FREQUENCY] in [Hz]
 FULL_STRETCH_POSE_OVERRIDE = None  # {~.~} list of home pose (xyz and quaternion) to override additional height not in base height
 
 # General constants
 IS_DEGREES = False  # {~.~} [CHANGE TO TRUE IF ROBOT USES DEGREES]
 DATA_LOCATION_PREFIX = "src/robot/data"  # {~.~} [CHANGE TO LOCATION DESIRED - will be robot/DATA_LOCATION_PREFIX/*]
 SIM_DATA_LOCATION_PREFIX = str(Path(__file__).resolve().parent / "data" / "sim")
-DEFAULT_TCP_PAYLOAD = 0.0  # {~.~} [CHANGE IF THE DEFAULT PAYLOAD IS NON_ZERO]
 
 MAX_ROBOT_JOINTS_BANDWIDTH = (
     5.0  # {~.~} Servo motor bandwidth. Leave as is if you don't know [Hz]
