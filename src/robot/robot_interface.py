@@ -191,7 +191,9 @@ class RobotInterface(ArmClient):
         self.robot: Axol | None = None
         self._axol_loop: asyncio.AbstractEventLoop | None = None
         self._axol_thread: threading.Thread | None = None
-        self._axol_call_lock = threading.Lock()
+        # {~.~} START: Phase 4 motion state.
+        self._axol_motion_enabled = False
+        # {~.~} END: Phase 4 motion state.
 
         # Reforge API and robot ID token is needed for "joint_tracker" product
         # Add it in the CLI with `--identify`
@@ -272,10 +274,8 @@ class RobotInterface(ArmClient):
     def _run_axol(self, coroutine) -> object:
         if self._axol_loop is None:
             raise RuntimeError("Axol event loop is not initialized.")
-        with self._axol_call_lock:
-            return asyncio.run_coroutine_threadsafe(
-                coroutine, self._axol_loop
-            ).result()
+        # {~.~} Submit one synchronous SDK call to the persistent Axol loop.
+        return asyncio.run_coroutine_threadsafe(coroutine, self._axol_loop).result()
 
     def _get_joint_positions(self) -> list[float]:
         if self.robot is None:
@@ -287,10 +287,13 @@ class RobotInterface(ArmClient):
 
     def close(self) -> None:
         """Stop recording and cleanly close the Axol async loop."""
+        # {~.~} START: Simplified Phase 4 close.
         if self.robot is None:
             return
         self.stop_recording()
-        self._run_axol(self.robot.disconnect())
+        # {~.~} Axol disables the selected seven-joint arm and closes its buses.
+        self._run_axol(self.robot.disable())
+        self._axol_motion_enabled = False  # {~.~} Clear ownership after success.
         if self._axol_loop is not None:
             self._axol_loop.call_soon_threadsafe(self._axol_loop.stop)
         if self._axol_thread is not None:
@@ -302,6 +305,7 @@ class RobotInterface(ArmClient):
         self.robot = None
         self._axol_loop = None
         self._axol_thread = None
+        # {~.~} END: Simplified Phase 4 close.
 
     # {~.~} END: Asynchronous Axol helpers and close.
 
@@ -435,11 +439,18 @@ class RobotInterface(ArmClient):
         Returns:
             the mode/state codes so they can be inspected when debugging.
         """
+        # {~.~} START: Simplified Phase 4 position entry.
         arm = self._require_connected_arm()  # noqa: F841
-
-        # {~.~} Select the Axol point-to-point control mode.
-        # {~.~} Replace the placeholder return after implementation and testing.
-        return 0
+        if not self._axol_motion_enabled:
+            # {~.~} Axol uses one realtime impedance controller for both modes.
+            self._run_axol(self.robot.enable())
+            self._axol_motion_enabled = True  # {~.~} Set ownership after success.
+        if self.robot.fault is not None:
+            raise RuntimeError(f"Axol realtime core faulted: {self.robot.fault}")  # {~.~}
+        if self.robot.limp is not None:
+            raise RuntimeError(f"Axol realtime core is limp: {self.robot.limp}")  # {~.~}
+        # {~.~} END: Simplified Phase 4 position entry.
+        return 0  # {~.~} Axol has no distinct position/servo mode code.
 
     def enter_servo_mode(self) -> Optional[int | None]:
         """Ensure the controller is set to servo control mode.
@@ -447,11 +458,7 @@ class RobotInterface(ArmClient):
         Returns:
             the mode/state codes so they can be inspected when debugging.
         """
-        arm = self._require_connected_arm()  # noqa: F841
-
-        # {~.~} Select the Axol servo control mode.
-        # {~.~} Replace the placeholder return after implementation and testing.
-        return 0
+        return self.enter_position_mode()  # {~.~} Axol shares one realtime control mode.
 
     def supports_teaching_mode(self) -> bool:
         """Return whether the robot supports manual teaching mode.
@@ -461,7 +468,7 @@ class RobotInterface(ArmClient):
         Returns:
             `bool` indicating whether manual teaching mode is implemented.
         """
-        return True
+        return False  # {~.~} Phase 3: teaching command is deferred to a later phase.
 
     def enter_teaching_mode(self) -> Optional[int | None]:
         """Ensure the controller is set to manual teaching mode.
@@ -487,7 +494,7 @@ class RobotInterface(ArmClient):
         Returns:
             `bool` indicating whether flange-button reads are implemented.
         """
-        return False
+        return False  # {~.~} Phase 3: Axol exposes no documented flange-button input.
 
     def read_flange_button_pressed(self) -> bool:
         """Return whether the flange button is currently pressed.
@@ -497,11 +504,7 @@ class RobotInterface(ArmClient):
         Returns:
             `bool` indicating the current flange-button state.
         """
-        arm = self._require_connected_arm()  # noqa: F841
-
-        # {~.~} Read the flange-button state using the Axol SDK.
-
-        return False
+        raise NotImplementedError("Axol does not expose a flange-button input.")  # {~.~} Phase 3: unsupported.
 
     def get_joint_state(self) -> tuple[list[float], list[float], list[float]]:
         """Return one joint state sample as ``(q, qd, tau)``.
