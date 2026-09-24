@@ -377,10 +377,10 @@
     },
     "src/robot/robot_interface.py": {
       "mode": 420,
-      "sha256": "35191ea761d638c777ee9b68b8313d34494e794321009a3ccd951ae1a5c8fe3e",
+      "sha256": "612f7e83900aa1db0f7cc5504c2a7cd500bcb837e8081e23c87b87c8f0cb4bc4",
       "sources": [
         {
-          "sha256": "35191ea761d638c777ee9b68b8313d34494e794321009a3ccd951ae1a5c8fe3e"
+          "sha256": "612f7e83900aa1db0f7cc5504c2a7cd500bcb837e8081e23c87b87c8f0cb4bc4"
         }
       ]
     },
@@ -602,7 +602,7 @@
     }
   },
   "mapping_revision": {
-    "sha256": "6a97ec60c8feb6b1fbe6e88d27a9840a47415125f41ff7530bb3a17b5cebd501"
+    "sha256": "e7dc5864d8695ebe4f27b3b294af6c87a5ed447421a95d7fefa1f17fd8a6ba9d"
   },
   "ownership_origin": {
     "revision": "7ca1840d90eabe820febc4c25e279ff92e42b185",
@@ -619,6 +619,6 @@
     "url": "https://files.pythonhosted.org/packages/b9/11/4b4061f0dad7d20951e843d390b7409d4e335c259efe34de8a2f036e1152/reforge_core-2.0.22-cp311-cp311-manylinux_2_28_x86_64.whl"
   },
   "source_input_basis": "working_tree",
-  "source_revision": "c343978eeb0ac0da49d5509650a3e6a04769427a",
+  "source_revision": "6a497c3a51ca4eb6d01cf228746f789a5f91aec7",
   "target": "trossen_arm"
 }
