@@ -575,7 +575,7 @@
     }
   },
   "mapping_revision": {
-    "sha256": "1870a68e779ae3d25359fc7424320a976bce3858561793f3ac713c867225f1c5"
+    "sha256": "ff740528b2c5e58670bc822c4054696195138785d95199ae6ea70400dcc89198"
   },
   "ownership_origin": {
     "revision": "d377c58d26960214e707dc137913433ddee9e5e7",
@@ -592,6 +592,6 @@
     "url": "https://files.pythonhosted.org/packages/b9/11/4b4061f0dad7d20951e843d390b7409d4e335c259efe34de8a2f036e1152/reforge_core-2.0.22-cp311-cp311-manylinux_2_28_x86_64.whl"
   },
   "source_input_basis": "working_tree",
-  "source_revision": "dbde768c9bb628587ddc3601c7670294908a3e63",
+  "source_revision": "ea90a7d804b79ea249c987186b292999fd6dcfdc",
   "target": "denso_bcap"
 }
