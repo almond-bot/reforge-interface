@@ -14,7 +14,9 @@ fixed joint at its URDF zero position.
 
 The generated URDF root is a new massless link whose origin is coincident with
 the selected first actuator's joint origin at zero position.  Its orientation
-is chosen so that the first actuator's positive axis points along world +Z.
+is chosen so that the first actuator's axis is parallel to world Z, with its
+positive direction along world -Z.  The Axol arm therefore extends above the
+world z=0 plane, toward world +Z.
 A fixed joint connects that new root to the complete original robot.  The torso
 and inactive arm consequently remain stationary collision geometry.
 World-frame pose constants used with a generated model must therefore be
@@ -367,10 +369,10 @@ def _cross(a: list[float], b: list[float]) -> list[float]:
     ]
 
 
-def _rotation_aligning_axis_to_world_z(axis: list[float]) -> Matrix4:
-    """Return the minimum rotation that maps ``axis`` onto world +Z."""
+def _rotation_aligning_axis_with_world_z(axis: list[float]) -> Matrix4:
+    """Map the positive actuator axis to -Z so the Axol arm extends toward +Z."""
 
-    target = [0.0, 0.0, 1.0]
+    target = [0.0, 0.0, -1.0]
     cross = _cross(axis, target)
     sine = math.sqrt(sum(value * value for value in cross))
     cosine = max(-1.0, min(1.0, sum(a * b for a, b in zip(axis, target))))
@@ -526,7 +528,7 @@ def _generate_arm_tree(
 
     root_to_actuator = _root_to_joint_frame(source_graph, selection.first_joint)
     actuator_axis = _joint_axis(source_graph.joints[selection.first_joint])
-    actuator_in_split_root = _rotation_aligning_axis_to_world_z(actuator_axis)
+    actuator_in_split_root = _rotation_aligning_axis_with_world_z(actuator_axis)
     split_root_to_source_root = _multiply(
         actuator_in_split_root,
         _inverse_rigid(root_to_actuator),
@@ -609,7 +611,8 @@ def _validate_generated_tree(
             raise SplitError(f"Generated URDF modified original link {name!r}.")
 
     # The new base origin must coincide with the first actuator origin at q=0,
-    # and the actuator's positive axis must point along split-world +Z.
+    # and its actuator axis must be parallel to world Z.  Axol extends opposite
+    # the positive actuator direction, so positive points -Z and the arm +Z.
     split_root_to_actuator = _multiply(
         _origin_transform(new_root_joint),
         source_root_to_actuator,
@@ -627,12 +630,12 @@ def _validate_generated_tree(
     ]
     axis_error = max(
         abs(actual - expected)
-        for actual, expected in zip(axis_in_split_root, (0.0, 0.0, 1.0))
+        for actual, expected in zip(axis_in_split_root, (0.0, 0.0, -1.0))
     )
     if origin_error > 1e-9 or axis_error > 1e-9:
         raise SplitError(
             "Generated base does not place the first actuator at its origin "
-            "with its positive axis along world +Z; "
+            "with its positive axis along world -Z; "
             f"origin error is {origin_error:.3g}, axis error is {axis_error:.3g}."
         )
 
@@ -683,7 +686,7 @@ def _print_summary(
     ]
     print(f"\n{selection.label.capitalize()} output: {output}")
     print(f"  First actuator frame: {selection.first_joint}")
-    print("  First actuator positive axis: world +Z")
+    print("  First actuator axis: parallel to world Z (positive direction -Z)")
     print(
         f"  Active/addressable joints ({len(selection.active_joints)}): "
         + (", ".join(selection.active_joints) or "none")
