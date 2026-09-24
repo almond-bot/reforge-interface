@@ -34,8 +34,15 @@ from reforge_core.hw_interfaces.imu_recorder import ImuRecorder
 # from standardbots import StandardBotsRobot, models
 # https://docs.standardbots.com/docs/latest/-/rest/intro/configuring-sdk
 # -----------------------------------------------------------------------
-from xarm import XArmAPI
 from scipy.spatial.transform import Rotation as R
+
+try:
+    from xarm import XArmAPI
+except ImportError as exc:
+    XArmAPI = None
+    _XARM_IMPORT_ERROR: ImportError | None = exc
+else:
+    _XARM_IMPORT_ERROR = None
 
 # User constants - EDITS REQUIRED
 BOT_ID = ""  # Need to update when I get the API working
@@ -54,7 +61,7 @@ DATA_LOCATION_PREFIX = "src/robot/data"
 SIM_DATA_LOCATION_PREFIX = str(Path(__file__).resolve().parent / "data" / "sim")
 DEFAULT_TCP_PAYLOAD = 0.0
 
-MAX_ROBOT_JOINTS_BANDWIDTH = 7.0
+MAX_ROBOT_JOINTS_BANDWIDTH = 5.0
 TEACHING_DETECTION_PARAM = 1
 FLANGE_BUTTON_INPUT_INDEX = 2
 FLANGE_BUTTON_PRESSED_VALUE = 1
@@ -62,8 +69,8 @@ FLANGE_BUTTON_PRESSED_VALUE = 1
 
 # {~.~} IMU information
 USE_REFORGE_IMU = True
-DEFAULT_IMU_COMM_MODE: Literal["ble", "usb", "virtual"] = "ble"
-DEFAULT_IMU_RECORD_MODE: Literal["streaming", "logging"] = "logging"
+DEFAULT_IMU_COMM_MODE: Literal["ble", "usb", "virtual"] = "usb"
+DEFAULT_IMU_RECORD_MODE: Literal["streaming", "logging"] = "streaming"
 DEFAULT_IMU_RECORD_FREQUENCY_HZ = ROBOT_MAX_FREQ
 
 
@@ -158,7 +165,7 @@ class RobotInterface(ArmClient):
         self.full_stretch_pose_override = FULL_STRETCH_POSE_OVERRIDE
 
         # Initialize URDF location
-        self.module_dir = files("robot")
+        self.module_dir = files(__package__)
         resource = self.module_dir.joinpath(URDF_PATH)
         with as_file(resource) as p:
             self._urdf_path = str(p)
@@ -181,6 +188,10 @@ class RobotInterface(ArmClient):
         # Add it in the CLI with `--identify`
         self.reforge_api_token = api_token
         try:
+            if XArmAPI is None:
+                raise ImportError(
+                    "UFactory integration requires xarm-python-sdk."
+                ) from _XARM_IMPORT_ERROR
             # {~.~} Instantiate live robot mode
             self.robot = XArmAPI(robot_ip, is_radian=not IS_DEGREES)
 

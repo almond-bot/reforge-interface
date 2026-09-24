@@ -1,7 +1,0 @@
---index-url https://pypi.org/simple/
-mcap-protobuf-support>=0.5,<0.6
-numpy>=2,<3
-pydantic
-reforge-core[all]>=2.0.15,<3
-scipy
-xarm-python-sdk[all]

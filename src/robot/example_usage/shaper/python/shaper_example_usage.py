@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
+import argparse
 from pathlib import Path
 
 import numpy as np
 
-from robot.example_usage.shaper.example_utility import (
+from robot.example_usage.shaper.python.example_utility import (
     concatenate_windowed_outputs,
     estimate_derivatives,
     generate_point_to_point_sample,
@@ -21,7 +22,6 @@ from reforge_core.control.shaper import (
 )
 
 THIS_DIR = Path(__file__).resolve().parent
-REPO_ROOT = THIS_DIR.parents[3]
 
 SAMPLE_TIME_S = 0.004
 NUM_AXES = 1
@@ -34,7 +34,7 @@ WINDOW_DURATION_S = 0.20
 SHAPER_ENABLED_WEIGHT = 1.0
 
 MODEL_DIRECTORY = THIS_DIR
-URDF_FILEPATH = REPO_ROOT / "src/robot/urdf/test_robot.urdf"
+DEFAULT_URDF_FILEPATH = THIS_DIR / "test_robot.urdf"
 
 SWITCH_MAX_VELOCITY_RAD_S = 3.0
 SWITCH_MAX_ACCELERATION_RAD_S2 = 45.0
@@ -46,13 +46,29 @@ SWITCH_MAX_QP_ATTEMPTS = 10
 EXAMPLE_BACKEND_KIND = ShaperBackendKind.PYTHON
 
 
-def main() -> None:
+def _parse_urdf_filepath() -> Path:
+    """Parse the consumer-supplied URDF path for this public example.
+
+    Returns:
+        `Path`: URDF path selected by the consumer or the co-located public
+        example default.
+    """
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--urdf-filepath",
+        type=Path,
+        default=DEFAULT_URDF_FILEPATH,
+        help="URDF file used by the Shaper dynamics model.",
+    )
+    return parser.parse_args().urdf_filepath
+
+
+def main(urdf_filepath: Path) -> None:
     """Run offline and streaming Covalent Shaper examples.
 
     Args:
-        None.
-    Returns:
-        `None`.
+        urdf_filepath: URDF file used by the Shaper dynamics model.
+
     Raises:
         RuntimeError: If Shaper initialization or simulation fails.
     """
@@ -80,7 +96,7 @@ def main() -> None:
     always_on_shaper = ShaperInterface(
         sample_time=SAMPLE_TIME_S,
         model_directory=str(MODEL_DIRECTORY),
-        urdf_filepath=str(URDF_FILEPATH),
+        urdf_filepath=str(urdf_filepath),
         num_axes=NUM_AXES,
         num_joints=NUM_JOINTS,
         backend_kind=EXAMPLE_BACKEND_KIND,
@@ -94,6 +110,7 @@ def main() -> None:
         residual_shaping_strategy=None,
         finalize_tail=False,
     )
+    # In a robot application, send the shaped trajectory through the robot SDK.
     # =========================================================================
     # End Example 1.
     # =========================================================================
@@ -117,7 +134,7 @@ def main() -> None:
     residual_offline_shaper = ShaperInterface(
         sample_time=SAMPLE_TIME_S,
         model_directory=str(MODEL_DIRECTORY),
-        urdf_filepath=str(URDF_FILEPATH),
+        urdf_filepath=str(urdf_filepath),
         num_axes=NUM_AXES,
         num_joints=NUM_JOINTS,
         backend_kind=EXAMPLE_BACKEND_KIND,
@@ -132,6 +149,7 @@ def main() -> None:
         residual_switch_limits=speed_first_switch_limits,
         finalize_tail=False,
     )
+    # In a robot application, send the shaped trajectory through the robot SDK.
     # =========================================================================
     # End Example 2.
     # =========================================================================
@@ -142,7 +160,7 @@ def main() -> None:
     windowed_shaper = ShaperInterface(
         sample_time=SAMPLE_TIME_S,
         model_directory=str(MODEL_DIRECTORY),
-        urdf_filepath=str(URDF_FILEPATH),
+        urdf_filepath=str(urdf_filepath),
         num_axes=NUM_AXES,
         num_joints=NUM_JOINTS,
         backend_kind=EXAMPLE_BACKEND_KIND,
@@ -177,6 +195,7 @@ def main() -> None:
     windowed_time_s, windowed_positions_rad = concatenate_windowed_outputs(
         shaped_windows
     )
+    # Each popped window would be sent to the robot SDK in timestamp order.
     # =========================================================================
     # End Example 3.
     # =========================================================================
@@ -187,7 +206,7 @@ def main() -> None:
     streaming_shaper = ShaperInterface(
         sample_time=SAMPLE_TIME_S,
         model_directory=str(MODEL_DIRECTORY),
-        urdf_filepath=str(URDF_FILEPATH),
+        urdf_filepath=str(urdf_filepath),
         num_axes=NUM_AXES,
         num_joints=NUM_JOINTS,
         backend_kind=EXAMPLE_BACKEND_KIND,
@@ -274,4 +293,4 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    main(urdf_filepath=_parse_urdf_filepath())
