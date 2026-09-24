@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Callable, Protocol, Sequence
 
-from robot.vendor.orin_bcap import BCAPClient
+from .vendor.orin_bcap import BCAPClient
 
 RC9_PROVIDER = "CaoProv.DENSO.VRC9"
 BCAP_TCP_PORT = 5007

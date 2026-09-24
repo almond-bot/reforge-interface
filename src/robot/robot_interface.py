@@ -6,7 +6,7 @@
 import numpy as np
 from importlib.resources import files, as_file
 from typing import Optional, Sequence
-from robot.cobotta_bcap import BcapTransportFactory, CobottaBcapRobot
+from .cobotta_bcap import BcapTransportFactory, CobottaBcapRobot
 from reforge_core.hw_interfaces.arm_client import ArmClient
 from reforge_core.hw_interfaces.imu_recorder import ImuRecorder
 
@@ -107,7 +107,7 @@ class RobotInterface(ArmClient):
             local_ip: Local machine IP address if required by the SDK.
             sdk_token: SDK authentication token.
             api_token: Reforge API token.
-            robot_id: Reforge robot ID (most cases) or SDK identifier _reforge_d by the control stack.
+            robot_id: Reforge robot ID (most cases) or SDK identifier used by the control stack.
             use_reforge_imu: Whether to use the built-in Reforge IMU backend
                 when `imu_recorder` is not supplied.
             imu_recorder: Optional vendor-specific recorder supplied directly
@@ -141,7 +141,7 @@ class RobotInterface(ArmClient):
         self.full_stretch_pose_override = FULL_STRETCH_POSE_OVERRIDE
 
         # Initialize URDF location
-        self.module_dir = files("robot")
+        self.module_dir = files(__package__)
         resource = self.module_dir.joinpath(URDF_PATH)
         with as_file(resource) as p:
             self._urdf_path = str(p)
@@ -409,13 +409,17 @@ class RobotInterface(ArmClient):
     def supports_teaching_mode(self) -> bool:
         """Return whether b-CAP exposes CRC9 Direct Teaching control.
 
+        CRC9 gravity compensation is distinct from Direct Teaching and does
+        not provide the documented remote teaching-mode transition required by
+        this interface.
+
         Returns:
             `bool` indicating whether manual teaching mode is implemented.
         """
         return False
 
     def enter_teaching_mode(self) -> Optional[int | None]:
-        """Leave Direct Teaching unchanged becaforge b-CAP does not control it.
+        """Leave Direct Teaching unchanged because b-CAP does not control it.
 
         CRC9 Direct Teaching is an operator-facing feature. The RC9 b-CAP and
         Provider guides do not document a command to enter it remotely.
