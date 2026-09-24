@@ -62,7 +62,7 @@ MAX_ROBOT_JOINTS_BANDWIDTH = (
 
 # {~.~} IMU information
 USE_REFORGE_IMU = True
-DEFAULT_IMU_COMM_MODE: Literal["ble", "usb", "virtual"] = "usb"
+DEFAULT_IMU_COMM_MODE: Literal["ble", "usb", "virtual"] = "virtual"
 DEFAULT_IMU_RECORD_MODE: Literal["streaming", "logging"] = "streaming"
 DEFAULT_IMU_RECORD_FREQUENCY_HZ = ROBOT_MAX_FREQ
 

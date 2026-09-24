@@ -1,0 +1,62 @@
+{
+  "base_joint_angle_count": 1,
+  "base_joint_count": 1,
+  "base_joint_grid_margin_source": [
+    "max_displacement"
+  ],
+  "base_joint_grid_rad": [
+    [
+      -2.967067074800567
+    ]
+  ],
+  "base_joint_indices": [
+    0
+  ],
+  "base_joint_limits_rad": [
+    [
+      -3.1416,
+      1.5708
+    ]
+  ],
+  "calibration_type": "shaper",
+  "downsampled_for_storage": false,
+  "feature_names": [
+    "j0_rad",
+    "v_deg",
+    "r_mm",
+    "inertia"
+  ],
+  "feature_units": [
+    "rad",
+    "deg",
+    "mm",
+    "kg_m2"
+  ],
+  "reference_base_angles_rad": [
+    0.0
+  ],
+  "runs": [
+    {
+      "axis_index": 0,
+      "base_joint_angles_rad": [
+        0.0
+      ],
+      "logical_pose_index": 0,
+      "motion_filename": "robotData_motion_pose0_axis0.csv",
+      "motion_mode": "sine_sweep",
+      "pose_index": 0,
+      "r_m": 0.2997099999999999,
+      "r_mm": 299.7099999999999,
+      "run_id": "normal-p0000-a00",
+      "run_role": "normal_full_axis",
+      "static_filename": "robotData_static_pose0_axis0.csv",
+      "status": "completed",
+      "swept_axis": 0,
+      "v_deg": 0.0,
+      "v_rad": 0.0
+    }
+  ],
+  "sample_frequency_hz": 200.0,
+  "saved_sample_frequency_hz": 200.0,
+  "schema_version": 3
+}
