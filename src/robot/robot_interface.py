@@ -23,6 +23,7 @@ from almond_axol.teleop.trajectory import plan_collision_aware_trajectory
 
 from reforge_core.hw_interfaces.arm_client import ArmClient
 from reforge_core.hw_interfaces.imu_recorder import ImuRecorder
+from reforge_core.util.utility import rotation_matrix_to_quaternion  # {~.~}
 
 # ------NOTES-----
 # 1. Where you see the #{~.~} symbol, you need to make a change. Use Ctrl+F to find all instances.
@@ -750,18 +751,35 @@ class RobotInterface(ArmClient):
             Tuple of three lists: joint positions `q` [rad], velocities `qd` [rad/s],
             and efforts/currents `tau` [SDK units].
         """
-        arm = self._require_connected_arm()  # noqa: F841
-        q: list[float] = []
-        qd: list[float] = []
-        tau: list[float] = []
+        # {~.~} START: Phase 8 selected-arm joint state.
+        robot = self._require_connected_arm()
 
-        # {~.~} Read joint position, velocity, and effort from the selected Axol arm.
+        async def read_joint_state():
+            return await asyncio.gather(
+                robot.get_positions(),
+                robot.get_velocities(),
+                robot.get_torques(),
+            )
 
-        if not IS_DEGREES:
-            q = [np.deg2rad(value) for value in q]
-            qd = [np.deg2rad(value) for value in qd]
-
+        try:
+            side_index = 0 if USE_LEFT else 1
+            channels = tuple(
+                np.asarray(states[side_index], dtype=float)[: self.num_joints]
+                for states in self._run_axol(read_joint_state())
+            )
+        except Exception as exc:
+            raise RuntimeError(
+                f"Unable to read {AXOL_SIDE} Axol joint state."
+            ) from exc
+        if any(
+            channel.shape != (self.num_joints,)
+            or not np.all(np.isfinite(channel))
+            for channel in channels
+        ):
+            raise RuntimeError(f"Axol {AXOL_SIDE} joint state is unavailable.")
+        q, qd, tau = (channel.tolist() for channel in channels)
         return q, qd, tau
+        # {~.~} END: Phase 8 selected-arm joint state.
 
     def get_tcp_pose(self) -> list[float]:
         """Return TCP pose as ``[x, y, z, qx, qy, qz, qw]``.
@@ -770,14 +788,24 @@ class RobotInterface(ArmClient):
             List of 7 floats representing the TCP pose in meters for positions
             and unitless normalized for quaternions.
         """
-        position: list[float] = []
-        quat: list[float] = []
-        arm = self._require_connected_arm()  # noqa: F841
-
-        # {~.~} Read and normalize the selected Axol TCP pose.
-
-        # Return tooltip pose as a list
-        return [*position, *quat]
+        # {~.~} START: Phase 8 selected-arm TCP pose.
+        joint_positions = self._get_joint_positions()
+        transform = self.model.get_transformation_matrix(
+            joint_angles=joint_positions,
+            link_name=AXOL_TCP_LINK,
+        )
+        position = np.asarray(transform[:3, 3], dtype=float)
+        if position.shape != (3,) or not np.all(np.isfinite(position)):
+            raise RuntimeError("Reforge model returned an invalid TCP position.")
+        quaternion = rotation_matrix_to_quaternion(
+            np.asarray(transform[:3, :3], dtype=float)
+        )
+        quaternion_norm = float(np.linalg.norm(quaternion))
+        if not np.isfinite(quaternion_norm) or quaternion_norm == 0.0:
+            raise RuntimeError("Reforge model returned an invalid TCP quaternion.")
+        quaternion = quaternion / quaternion_norm
+        return [*position.tolist(), *quaternion.tolist()]
+        # {~.~} END: Phase 8 selected-arm TCP pose.
 
     # {~.~} END OF REQUIRED METHODS
 
