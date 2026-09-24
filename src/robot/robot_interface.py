@@ -16,7 +16,9 @@ import numpy as np
 
 # {~.~} Import the robot SDK and required modules here.
 from almond_axol.constants import ARM_JOINTS, CAN_LEFT, CAN_RIGHT, urdf_arm_joint_names
+from almond_axol.kinematics import KinematicsSolver, plan_linear_segment
 from almond_axol.robot import Axol
+from almond_axol.teleop.trajectory import plan_collision_aware_trajectory
 # {~.~} END: Axol SDK imports.
 
 from reforge_core.hw_interfaces.arm_client import ArmClient
@@ -49,6 +51,10 @@ AXOL_SDK_ARM_ATTRIBUTE = AXOL_SIDE
 AXOL_TCP_LINK = f"{AXOL_SIDE}_gripper"
 AXOL_JOINT_NAMES = tuple(joint.value for joint in ARM_JOINTS)
 AXOL_URDF_JOINT_NAMES = tuple(urdf_arm_joint_names(is_left=USE_LEFT))
+AXOL_MAX_JOINT_SPEED = 2.0 * np.pi
+AXOL_MAX_JOINT_ACCELERATION = 3.5 * 2.0 * np.pi
+AXOL_MAX_CARTESIAN_SPEED = 0.5  # {~.~} 50% waypoint speed is 0.25 m/s.
+AXOL_MAX_ANGULAR_SPEED = 2.4  # {~.~} 50% waypoint speed is 1.2 rad/s.
 BOT_ID = ""
 URDF_PATH = f"urdf/axol-{AXOL_SIDE}.urdf"
 FULL_STRETCH_XYZ = [0.781526 if USE_LEFT else -0.781526, 0.0, 0.0]
@@ -199,6 +205,10 @@ class RobotInterface(ArmClient):
         self._axol_teaching_future: Future[None] | None = None  # {~.~}
         self._axol_teaching_stop = threading.Event()  # {~.~}
         # {~.~} END: Phase 6 teaching state.
+        # {~.~} START: Phase 7 point-to-point state.
+        self._axol_kinematics_solver: KinematicsSolver | None = None  # {~.~}
+        self._axol_move_future: Future[None] | None = None  # {~.~}
+        # {~.~} END: Phase 7 point-to-point state.
 
         # Reforge API and robot ID token is needed for "joint_tracker" product
         # Add it in the CLI with `--identify`
@@ -211,6 +221,8 @@ class RobotInterface(ArmClient):
                 left_joints=ARM_JOINTS if USE_LEFT else None,
                 right_joints=None if USE_LEFT else ARM_JOINTS,
                 loop_hz=ROBOT_MAX_FREQ,
+                max_vel=AXOL_MAX_JOINT_SPEED,
+                max_accel=AXOL_MAX_JOINT_ACCELERATION,
             )
             self._axol_loop = asyncio.new_event_loop()
             self._axol_thread = threading.Thread(
@@ -282,6 +294,63 @@ class RobotInterface(ArmClient):
         # {~.~} Submit one synchronous SDK call to the persistent Axol loop.
         return asyncio.run_coroutine_threadsafe(coroutine, self._axol_loop).result()
 
+    # {~.~} START: Phase 7 Axol point-to-point helpers.
+    async def _axol_joint_move(self, robot: Axol, trajectory: np.ndarray) -> None:
+        period_s = 1.0 / ROBOT_MAX_FREQ
+        loop = asyncio.get_running_loop()
+        for target in trajectory:
+            started_s = loop.time()
+            command = np.zeros(8, dtype=np.float32)
+            command[: len(ARM_JOINTS)] = target
+            await robot.motion_control(**{AXOL_SDK_ARM_ATTRIBUTE: command})
+            if robot.fault is not None:
+                raise RuntimeError(f"Axol realtime core faulted: {robot.fault}")
+            if robot.limp is not None:
+                raise RuntimeError(f"Axol realtime core is limp: {robot.limp}")
+            await asyncio.sleep(max(0.0, period_s - (loop.time() - started_s)))
+
+    def _wait_for_axol_move(self) -> None:
+        future = self._axol_move_future
+        if future is None:
+            return
+        try:
+            future.result()
+        finally:
+            self._axol_move_future = None
+
+    def _get_axol_kinematics_solver(self) -> KinematicsSolver:
+        if self._axol_kinematics_solver is None:
+            self._axol_kinematics_solver = KinematicsSolver()
+        return self._axol_kinematics_solver
+
+    @staticmethod
+    def _validate_move_speed(speed: float) -> float:
+        try:
+            speed_percent = float(speed)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError("Axol move speed must be numeric.") from exc
+        if not np.isfinite(speed_percent) or not 0.0 < speed_percent <= 100.0:
+            raise ValueError("Axol move speed must be in (0, 100].")
+        return speed_percent / 100.0
+
+    def _submit_axol_trajectory(
+        self, robot: Axol, trajectory: Sequence[Sequence[float]], wait: bool
+    ) -> None:
+        arm_trajectory = np.asarray(trajectory, dtype=np.float32)
+        if arm_trajectory.ndim != 2 or arm_trajectory.shape[1] != len(ARM_JOINTS):
+            raise RuntimeError("Axol planner returned an invalid arm trajectory.")
+        if not np.all(np.isfinite(arm_trajectory)):
+            raise RuntimeError("Axol planner returned a non-finite arm trajectory.")
+        if self._axol_loop is None:
+            raise RuntimeError("Axol event loop is not initialized.")
+        self._run_axol(self._axol_joint_move(robot, arm_trajectory[:1]))
+        self._axol_move_future = asyncio.run_coroutine_threadsafe(
+            self._axol_joint_move(robot, arm_trajectory[1:]), self._axol_loop
+        )
+        if wait:
+            self._wait_for_axol_move()
+    # {~.~} END: Phase 7 Axol point-to-point helpers.
+
     # {~.~} START: Phase 6 Axol teaching helpers.
     async def _axol_teaching_loop(self, robot: Axol) -> None:
         period_s = 1.0 / ROBOT_MAX_FREQ
@@ -316,6 +385,12 @@ class RobotInterface(ArmClient):
         # {~.~} START: Simplified Phase 4 close.
         if self.robot is None:
             return
+        # {~.~} START: Phase 7 point-to-point cleanup.
+        try:
+            self._wait_for_axol_move()
+        except Exception:
+            pass  # {~.~} Disable must still run if a move failed.
+        # {~.~} END: Phase 7 point-to-point cleanup.
         # {~.~} START: Phase 6 teaching cleanup.
         try:
             self._stop_axol_teaching()
@@ -401,13 +476,39 @@ class RobotInterface(ArmClient):
             An integer status code from the robot's command interface, if applicable.
             If the robot does not provide a status code, return 0 for success or raise an exception for failure.
         """
-        if IS_DEGREES:
-            target_joints = list(np.rad2deg(angle) for angle in target_joints)
+        # {~.~} START: Phase 7 Axol joint point-to-point command.
+        target = self._validate_joint_target(target_joints)
+        speed_scale = self._validate_move_speed(speed)
+        lower_limits, upper_limits = self.model.joint_limits
+        if np.any(target < lower_limits) or np.any(target > upper_limits):
+            raise ValueError("Axol joint target exceeds the URDF joint limits.")
 
-        arm = self._require_connected_arm()  # noqa: F841
-        # {~.~} Send a joint target through the selected Axol arm.
-        # {~.~} Replace the placeholder return after implementation and testing.
-        return 1
+        self.enter_position_mode()
+        robot = self._require_connected_arm()
+        solver = self._get_axol_kinematics_solver()
+        start = np.asarray(self._get_joint_positions(), dtype=np.float32)
+        indices = solver.left_indices if USE_LEFT else solver.right_indices
+        q_from = np.zeros(solver.num_joints, dtype=np.float32)
+        q_from[indices] = start
+        q_to = q_from.copy()
+        q_to[indices] = target
+        full_trajectory = plan_collision_aware_trajectory(
+            solver,
+            q_from,
+            q_to,
+            speed=AXOL_MAX_JOINT_SPEED * speed_scale / 1.5,
+            rate=ROBOT_MAX_FREQ,
+            min_duration=1.0 / ROBOT_MAX_FREQ,
+        )
+        planned = np.asarray(full_trajectory, dtype=np.float32)
+        if not np.all(np.isfinite(planned)):
+            raise RuntimeError("Axol joint planner returned non-finite values.")
+        inactive = solver.right_indices if USE_LEFT else solver.left_indices
+        if np.max(np.abs(planned[:, inactive])) > 1e-4:
+            raise RuntimeError("Axol planner could not keep the inactive arm fixed.")
+        self._submit_axol_trajectory(robot, planned[:, indices], wait)
+        # {~.~} END: Phase 7 Axol joint point-to-point command.
+        return 0  # {~.~} Phase 7 command submitted successfully.
 
     def command_move_pose(
         self,
@@ -432,13 +533,71 @@ class RobotInterface(ArmClient):
             An integer status code from the robot's command interface, if applicable.
             If the robot does not provide a status code, return 0 for success or raise an exception for failure.
         """
+        # {~.~} START: Phase 7 Axol Cartesian point-to-point command.
         if locked_joints is not None:
             raise RuntimeError("locked_joints is only supported in simulator mode.")
-
-        arm = self._require_connected_arm()  # noqa: F841
-        # {~.~} Send a Cartesian target through the selected Axol arm.
-        # {~.~} Replace the placeholder return after implementation and testing.
-        return 1
+        speed_scale = self._validate_move_speed(speed)
+        try:
+            xyz = np.asarray(target_xyz, dtype=float)
+            quat = np.asarray(target_quat, dtype=float)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError("Axol Cartesian targets must be numeric.") from exc
+        if xyz.shape != (3,) or quat.shape != (4,):
+            raise ValueError("Expected target_xyz shape (3,) and target_quat shape (4,).")
+        if not np.all(np.isfinite(xyz)) or not np.all(np.isfinite(quat)):
+            raise ValueError("Axol Cartesian targets must be finite.")
+        quat_norm = float(np.linalg.norm(quat))
+        if not np.isfinite(quat_norm) or quat_norm == 0.0:
+            raise ValueError("Axol target quaternion must have a finite, nonzero norm.")
+        self.enter_position_mode()
+        robot = self._require_connected_arm()
+        start = np.asarray(self._get_joint_positions(), dtype=np.float32)
+        target_pose = np.concatenate((xyz, quat / quat_norm))
+        target, report = self.model.get_inverse_kinematics(
+            target_pose=target_pose,
+            initial_angles=start,
+            tol=1e-4,
+            link_name=AXOL_TCP_LINK,
+            get_report=True,
+        )
+        if not report.converged:
+            raise RuntimeError(
+                "Axol pose IK did not converge "
+                f"({report.position_error_mag:.6f} m, "
+                f"{report.rotation_error_mag:.6f} rad error)."
+            )
+        target = self._validate_joint_target(target)
+        lower_limits, upper_limits = self.model.joint_limits
+        if np.any(target < lower_limits) or np.any(target > upper_limits):
+            raise ValueError("Axol pose IK target exceeds the URDF joint limits.")
+        solver = self._get_axol_kinematics_solver()
+        indices = solver.left_indices if USE_LEFT else solver.right_indices
+        q_from = np.zeros(solver.num_joints, dtype=np.float32)
+        q_from[indices] = start
+        q_to = q_from.copy()
+        q_to[indices] = target
+        full_trajectory = plan_linear_segment(
+            solver,
+            q_from,
+            q_to,
+            speed=AXOL_MAX_CARTESIAN_SPEED * speed_scale,
+            ang_speed=AXOL_MAX_ANGULAR_SPEED * speed_scale,
+            rate=ROBOT_MAX_FREQ,
+            tool_offset=(0.0, 0.0, 0.0),
+            min_travel=1e-6,
+            min_rotation=1e-6,
+            label=f"{AXOL_SIDE} arm point-to-point move",
+        )
+        arm_trajectory = np.asarray(
+            [q[indices] for q in full_trajectory], dtype=np.float32
+        )
+        step_limit = AXOL_MAX_JOINT_SPEED * speed_scale / ROBOT_MAX_FREQ
+        steps = np.diff(np.vstack((start, arm_trajectory)), axis=0)
+        if np.max(np.abs(steps)) > step_limit:
+            raise RuntimeError("Axol linear planner exceeded the joint-speed limit.")
+        self._submit_axol_trajectory(robot, arm_trajectory, wait)
+        # {~.~} END: Phase 7 Axol Cartesian point-to-point command.
+        return 0  # {~.~} Phase 7 command submitted successfully.
 
     # {~.~} START: Shared Axol joint-target validation.
     @staticmethod
@@ -476,6 +635,7 @@ class RobotInterface(ArmClient):
             If the robot does not provide a status code, return 0 for success or raise an exception for failure.
         """
         # {~.~} START: Phase 5 Axol servo command.
+        self._wait_for_axol_move()  # {~.~} Phase 7: do not overlap P2P and servo streams.
         robot = self._require_connected_arm()
         del wait  # Axol has no target-settled acknowledgement.
         target = self._validate_joint_target(target_joints)
@@ -500,6 +660,7 @@ class RobotInterface(ArmClient):
             the mode/state codes so they can be inspected when debugging.
         """
         # {~.~} START: Phase 6 tracking-mode transition.
+        self._wait_for_axol_move()  # {~.~} Phase 7: serialize mode changes after P2P motion.
         robot = self._require_connected_arm()
         if not self._axol_motion_enabled:
             # {~.~} Axol uses one realtime impedance controller for both modes.
