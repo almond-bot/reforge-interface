@@ -508,7 +508,7 @@
         <limit lower="-1.5708" upper="1.5708" velocity="30.0" effort="87.0" />
     </joint>
     <joint name="__split_right_arm_base_to_original_root" type="fixed">
-        <origin xyz="0.12999999999999975 0 -0.85999999999999999" rpy="0 0 -1.5707963267948966" />
+        <origin xyz="0.85999999999999999 0 0.12999999999999975" rpy="1.5707963267948963 0 -1.5707963267948966" />
         <parent link="__split_right_arm_base" />
         <child link="root" />
     </joint>

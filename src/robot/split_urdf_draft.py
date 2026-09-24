@@ -12,17 +12,29 @@ Only revolute joints on the selected arm path remain movable.  Every other
 movable joint, including continuous and prismatic joints, is converted to a
 fixed joint at its URDF zero position.
 
-The generated URDF root is a new massless link whose frame is coincident with
-the selected first actuator's joint frame at zero position.  A fixed joint with
-the inverse transform connects that new root to the complete original robot.
-Consequently, the torso and inactive arm remain stationary collision geometry.
+The generated URDF root is a new massless link whose origin is coincident with
+the selected first actuator's joint origin at zero position.  Its orientation
+is chosen so that the first actuator's positive axis points along world +Z.
+A fixed joint connects that new root to the complete original robot.  The torso
+and inactive arm consequently remain stationary collision geometry.
+World-frame pose constants used with a generated model must therefore be
+re-expressed in that model's new root frame.
 
 Example::
 
-    python src/robot/split_urdf_draft.py src/robot/urdf/axol.urdf \
+    python src/robot/split_urdf_draft.py split src/robot/urdf/axol.urdf \
         --left-first-joint left_s1_0 \
         --right-first-joint right_s1_0 \
         --visualize
+
+Existing generated URDFs can be viewed without splitting them again::
+
+    python src/robot/split_urdf_draft.py simulate \
+        src/robot/urdf/axol-left.urdf \
+        src/robot/urdf/axol-right.urdf
+
+For compatibility, the original command form without the explicit ``split``
+subcommand remains supported.
 
 Splitting uses only the Python standard library.  The optional viewer requires
 ``viser[urdf]``.  The script expects a URDF, not a xacro file, and assumes the
@@ -321,6 +333,90 @@ def _inverse_rigid(transform: Matrix4) -> Matrix4:
     ] + [[0.0, 0.0, 0.0, 1.0]]
 
 
+def _joint_axis(joint: ET.Element) -> list[float]:
+    """Return a selected revolute joint's normalized local axis."""
+
+    if joint.get("type") != "revolute":
+        raise SplitError(
+            f"First actuator joint {joint.get('name')!r} must be revolute; "
+            f"found type {joint.get('type')!r}."
+        )
+    axis = joint.find("axis")
+    axis_text = axis.get("xyz", "1 0 0") if axis is not None else "1 0 0"
+    try:
+        values = [float(value) for value in axis_text.split()]
+    except ValueError as exc:
+        raise SplitError(
+            f"Joint {joint.get('name')!r} has a non-numeric axis."
+        ) from exc
+    if len(values) != 3 or not all(math.isfinite(value) for value in values):
+        raise SplitError(
+            f"Joint {joint.get('name')!r} must have a finite three-value axis."
+        )
+    norm = math.sqrt(sum(value * value for value in values))
+    if norm <= 1e-12:
+        raise SplitError(f"Joint {joint.get('name')!r} has a zero-length axis.")
+    return [value / norm for value in values]
+
+
+def _cross(a: list[float], b: list[float]) -> list[float]:
+    return [
+        a[1] * b[2] - a[2] * b[1],
+        a[2] * b[0] - a[0] * b[2],
+        a[0] * b[1] - a[1] * b[0],
+    ]
+
+
+def _rotation_aligning_axis_to_world_z(axis: list[float]) -> Matrix4:
+    """Return the minimum rotation that maps ``axis`` onto world +Z."""
+
+    target = [0.0, 0.0, 1.0]
+    cross = _cross(axis, target)
+    sine = math.sqrt(sum(value * value for value in cross))
+    cosine = max(-1.0, min(1.0, sum(a * b for a, b in zip(axis, target))))
+
+    if sine <= 1e-12:
+        if cosine > 0.0:
+            return _identity()
+        # The vectors are antiparallel. Pick a deterministic axis orthogonal
+        # to the source and rotate by pi: R = 2*u*u^T - I.
+        reference = [1.0, 0.0, 0.0] if abs(axis[0]) < 0.9 else [0.0, 1.0, 0.0]
+        rotation_axis = _cross(axis, reference)
+        axis_norm = math.sqrt(sum(value * value for value in rotation_axis))
+        rotation_axis = [value / axis_norm for value in rotation_axis]
+        rotation = [
+            [
+                2.0 * rotation_axis[row] * rotation_axis[col]
+                - (1.0 if row == col else 0.0)
+                for col in range(3)
+            ]
+            for row in range(3)
+        ]
+    else:
+        # Rodrigues' formula with an unnormalized cross-product matrix.
+        x, y, z = cross
+        skew = [[0.0, -z, y], [z, 0.0, -x], [-y, x, 0.0]]
+        skew_squared = [
+            [
+                sum(skew[row][k] * skew[k][col] for k in range(3))
+                for col in range(3)
+            ]
+            for row in range(3)
+        ]
+        scale = (1.0 - cosine) / (sine * sine)
+        rotation = [
+            [
+                (1.0 if row == col else 0.0)
+                + skew[row][col]
+                + skew_squared[row][col] * scale
+                for col in range(3)
+            ]
+            for row in range(3)
+        ]
+
+    return [[*rotation[row], 0.0] for row in range(3)] + [[0.0, 0.0, 0.0, 1.0]]
+
+
 def _matrix_to_xyz_rpy(transform: Matrix4) -> tuple[list[float], list[float]]:
     xyz = [transform[row][3] for row in range(3)]
     r20 = max(-1.0, min(1.0, transform[2][0]))
@@ -429,8 +525,13 @@ def _generate_arm_tree(
     removed_transmissions = _remove_inactive_transmissions(robot, set(frozen))
 
     root_to_actuator = _root_to_joint_frame(source_graph, selection.first_joint)
-    actuator_to_root = _inverse_rigid(root_to_actuator)
-    xyz, rpy = _matrix_to_xyz_rpy(actuator_to_root)
+    actuator_axis = _joint_axis(source_graph.joints[selection.first_joint])
+    actuator_in_split_root = _rotation_aligning_axis_to_world_z(actuator_axis)
+    split_root_to_source_root = _multiply(
+        actuator_in_split_root,
+        _inverse_rigid(root_to_actuator),
+    )
+    xyz, rpy = _matrix_to_xyz_rpy(split_root_to_source_root)
 
     link_names = set(generated_graph.links)
     joint_names = set(generated_graph.joints)
@@ -507,17 +608,32 @@ def _validate_generated_tree(
         if _element_signature(generated_link) != _element_signature(source_link):
             raise SplitError(f"Generated URDF modified original link {name!r}.")
 
-    # The new base frame must coincide with the first actuator frame at q=0.
-    check = _multiply(_origin_transform(new_root_joint), source_root_to_actuator)
-    error = max(
-        abs(check[row][col] - (1.0 if row == col else 0.0))
-        for row in range(4)
-        for col in range(4)
+    # The new base origin must coincide with the first actuator origin at q=0,
+    # and the actuator's positive axis must point along split-world +Z.
+    split_root_to_actuator = _multiply(
+        _origin_transform(new_root_joint),
+        source_root_to_actuator,
     )
-    if error > 1e-9:
+    origin_error = max(
+        abs(split_root_to_actuator[row][3]) for row in range(3)
+    )
+    actuator_axis = _joint_axis(source_graph.joints[selection.first_joint])
+    axis_in_split_root = [
+        sum(
+            split_root_to_actuator[row][col] * actuator_axis[col]
+            for col in range(3)
+        )
+        for row in range(3)
+    ]
+    axis_error = max(
+        abs(actual - expected)
+        for actual, expected in zip(axis_in_split_root, (0.0, 0.0, 1.0))
+    )
+    if origin_error > 1e-9 or axis_error > 1e-9:
         raise SplitError(
-            "Generated base does not coincide with the first actuator frame; "
-            f"transform error is {error:.3g}."
+            "Generated base does not place the first actuator at its origin "
+            "with its positive axis along world +Z; "
+            f"origin error is {origin_error:.3g}, axis error is {axis_error:.3g}."
         )
 
 
@@ -567,6 +683,7 @@ def _print_summary(
     ]
     print(f"\n{selection.label.capitalize()} output: {output}")
     print(f"  First actuator frame: {selection.first_joint}")
+    print("  First actuator positive axis: world +Z")
     print(
         f"  Active/addressable joints ({len(selection.active_joints)}): "
         + (", ".join(selection.active_joints) or "none")
@@ -646,8 +763,24 @@ def _add_viser_joint_controls(server: object, robot: object, label: str) -> None
     update_robot()
 
 
-def _run_viser(left_urdf: Path, right_urdf: Path, *, port: int) -> None:
-    """Display both generated URDFs side-by-side until interrupted."""
+def simulate(
+    left_urdf: str | Path,
+    right_urdf: str | Path,
+    *,
+    port: int = 8080,
+) -> None:
+    """Display two existing split URDFs side-by-side until interrupted."""
+
+    if not 1 <= port <= 65535:
+        raise SplitError("Viser port must be between 1 and 65535.")
+
+    left_path = Path(left_urdf).expanduser().resolve()
+    right_path = Path(right_urdf).expanduser().resolve()
+    for label, path in (("left", left_path), ("right", right_path)):
+        if not path.is_file():
+            raise SplitError(
+                f"The {label} URDF does not exist or is not a file: {path}"
+            )
 
     try:
         import time
@@ -656,7 +789,7 @@ def _run_viser(left_urdf: Path, right_urdf: Path, *, port: int) -> None:
         from viser.extras import ViserUrdf
     except ImportError as exc:
         raise SplitError(
-            "--visualize requires Viser URDF support; install it with "
+            "Simulation requires Viser URDF support; install it with "
             "`python -m pip install 'viser[urdf]'`."
         ) from exc
 
@@ -695,7 +828,7 @@ def _run_viser(left_urdf: Path, right_urdf: Path, *, port: int) -> None:
 
         left_robot = ViserUrdf(
             server,
-            urdf_or_path=left_urdf,
+            urdf_or_path=left_path,
             root_node_name="/left/robot",
             mesh_color_override=(0.45, 0.65, 1.0, 0.55),
             collision_mesh_color_override=(1.0, 0.25, 0.05, 0.35),
@@ -704,7 +837,7 @@ def _run_viser(left_urdf: Path, right_urdf: Path, *, port: int) -> None:
         )
         right_robot = ViserUrdf(
             server,
-            urdf_or_path=right_urdf,
+            urdf_or_path=right_path,
             root_node_name="/right/robot",
             mesh_color_override=(0.45, 0.9, 0.6, 0.55),
             collision_mesh_color_override=(1.0, 0.25, 0.05, 0.35),
@@ -734,7 +867,7 @@ def _run_viser(left_urdf: Path, right_urdf: Path, *, port: int) -> None:
         _add_viser_joint_controls(server, right_robot, "right")
 
         print(f"\nViser viewer: http://127.0.0.1:{port}")
-        print("The generated models are shown side-by-side. Press Ctrl+C to close.")
+        print("The selected models are shown side-by-side. Press Ctrl+C to close.")
         while True:
             time.sleep(0.25)
     except KeyboardInterrupt:
@@ -749,23 +882,31 @@ def _default_output(source: Path, label: str) -> Path:
     return source.with_name(f"{source.stem}-{label}{source.suffix}")
 
 
-def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        description=(
-            "Generate one URDF per arm while retaining the complete robot as "
-            "visual and collision geometry."
-        )
-    )
+def _add_split_arguments(parser: argparse.ArgumentParser) -> None:
+    """Add arguments used only when generating split URDFs."""
+
     parser.add_argument("urdf", type=Path, help="Source bimanual URDF.")
-    parser.add_argument("--left-first-joint", help="First actuator joint of the left arm.")
-    parser.add_argument("--right-first-joint", help="First actuator joint of the right arm.")
+    parser.add_argument(
+        "--left-first-joint",
+        help="First actuator joint of the left arm.",
+    )
+    parser.add_argument(
+        "--right-first-joint",
+        help="First actuator joint of the right arm.",
+    )
     parser.add_argument(
         "--left-end-joint",
-        help="Last left-arm joint; required non-interactively if its subtree branches.",
+        help=(
+            "Last left-arm joint; required non-interactively if its subtree "
+            "branches."
+        ),
     )
     parser.add_argument(
         "--right-end-joint",
-        help="Last right-arm joint; required non-interactively if its subtree branches.",
+        help=(
+            "Last right-arm joint; required non-interactively if its subtree "
+            "branches."
+        ),
     )
     parser.add_argument("--left-output", type=Path, help="Left output URDF path.")
     parser.add_argument("--right-output", type=Path, help="Right output URDF path.")
@@ -784,11 +925,50 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=8080,
         help="Port for --visualize (default: %(default)s).",
     )
-    return parser.parse_args(argv)
+
+
+def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    raw_args = list(sys.argv[1:] if argv is None else argv)
+    commands = {"split", "simulate"}
+    if raw_args and raw_args[0] not in commands | {"-h", "--help"}:
+        # Preserve the original `script.py SOURCE ...` split invocation.
+        raw_args.insert(0, "split")
+
+    parser = argparse.ArgumentParser(
+        description="Split a bimanual URDF or view existing split URDFs."
+    )
+    subparsers = parser.add_subparsers(dest="command", required=True)
+    split_parser = subparsers.add_parser(
+        "split",
+        help="Generate one URDF per arm.",
+        description=(
+            "Generate one URDF per arm while retaining the complete robot as "
+            "visual and collision geometry."
+        ),
+    )
+    _add_split_arguments(split_parser)
+
+    simulate_parser = subparsers.add_parser(
+        "simulate",
+        help="View two existing split URDFs without regenerating them.",
+    )
+    simulate_parser.add_argument("left_urdf", type=Path, help="Left-arm URDF.")
+    simulate_parser.add_argument("right_urdf", type=Path, help="Right-arm URDF.")
+    simulate_parser.add_argument(
+        "--viser-port",
+        type=int,
+        default=8080,
+        help="Viser port (default: %(default)s).",
+    )
+    return parser.parse_args(raw_args)
 
 
 def main(argv: list[str] | None = None) -> int:
     args = _parse_args(argv)
+    if args.command == "simulate":
+        simulate(args.left_urdf, args.right_urdf, port=args.viser_port)
+        return 0
+
     source = args.urdf.resolve()
     left_output = (args.left_output or _default_output(source, "left")).resolve()
     right_output = (args.right_output or _default_output(source, "right")).resolve()
@@ -847,9 +1027,7 @@ def main(argv: list[str] | None = None) -> int:
             file=sys.stderr,
         )
     if args.visualize:
-        if not 1 <= args.viser_port <= 65535:
-            raise SplitError("--viser-port must be between 1 and 65535.")
-        _run_viser(left_output, right_output, port=args.viser_port)
+        simulate(left_output, right_output, port=args.viser_port)
     return 0
 
 
