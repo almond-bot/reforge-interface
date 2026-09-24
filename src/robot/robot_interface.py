@@ -408,6 +408,23 @@ class RobotInterface(ArmClient):
         # {~.~} Replace the placeholder return after implementation and testing.
         return 1
 
+    # {~.~} START: Shared Axol joint-target validation.
+    @staticmethod
+    def _validate_joint_target(
+        target_joints: Sequence[float] | np.ndarray,
+    ) -> np.ndarray:
+        try:
+            target = np.asarray(target_joints, dtype=np.float32)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError("Axol joint targets must be numeric.") from exc
+        if target.shape != (len(ARM_JOINTS),):
+            raise ValueError(f"Expected {len(ARM_JOINTS)} joint targets.")
+        if not np.all(np.isfinite(target)):
+            raise ValueError("Axol joint targets must be finite.")
+        return target
+
+    # {~.~} END: Shared Axol joint-target validation.
+    # {~.~} START: Phase 5 servo command method.
     def command_servo_j(
         self,
         target_joints: np.ndarray | list[float],
@@ -426,12 +443,23 @@ class RobotInterface(ArmClient):
             An integer status code from the robot's command interface, if applicable.
             If the robot does not provide a status code, return 0 for success or raise an exception for failure.
         """
-        arm = self._require_connected_arm()  # noqa: F841
+        # {~.~} START: Phase 5 Axol servo command.
+        robot = self._require_connected_arm()
+        del wait  # Axol has no target-settled acknowledgement.
+        target = self._validate_joint_target(target_joints)
+        if robot.fault is not None:
+            raise RuntimeError(f"Axol realtime core faulted: {robot.fault}")
+        if robot.limp is not None:
+            raise RuntimeError(f"Axol realtime core is limp: {robot.limp}")
+        command = np.zeros(8, dtype=np.float32)
+        command[: len(ARM_JOINTS)] = target
+        self._run_axol(
+            robot.motion_control(**{AXOL_SDK_ARM_ATTRIBUTE: command})
+        )
+        # {~.~} END: Phase 5 Axol servo command.
+        return 0  # {~.~} Phase 5: command submitted successfully.
 
-        # {~.~} Publish joint positions to the selected Axol arm.
-        # {~.~} Replace the placeholder return after implementation and testing.
-        return 1
-
+    # {~.~} END: Phase 5 servo command method.
     def enter_position_mode(self) -> Optional[int | None]:
         """
         Ensure the controller is in point-to-point position mode before issuing queued P2P moves.
