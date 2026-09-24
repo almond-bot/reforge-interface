@@ -5,6 +5,7 @@
 
 # {~.~} START: Axol SDK imports.
 import asyncio
+from concurrent.futures import Future
 import threading
 from collections.abc import Mapping
 from importlib.resources import as_file, files
@@ -194,6 +195,10 @@ class RobotInterface(ArmClient):
         # {~.~} START: Phase 4 motion state.
         self._axol_motion_enabled = False
         # {~.~} END: Phase 4 motion state.
+        # {~.~} START: Phase 6 teaching state.
+        self._axol_teaching_future: Future[None] | None = None  # {~.~}
+        self._axol_teaching_stop = threading.Event()  # {~.~}
+        # {~.~} END: Phase 6 teaching state.
 
         # Reforge API and robot ID token is needed for "joint_tracker" product
         # Add it in the CLI with `--identify`
@@ -277,6 +282,27 @@ class RobotInterface(ArmClient):
         # {~.~} Submit one synchronous SDK call to the persistent Axol loop.
         return asyncio.run_coroutine_threadsafe(coroutine, self._axol_loop).result()
 
+    # {~.~} START: Phase 6 Axol teaching helpers.
+    async def _axol_teaching_loop(self, robot: Axol) -> None:
+        period_s = 1.0 / ROBOT_MAX_FREQ
+        loop = asyncio.get_running_loop()
+        while not self._axol_teaching_stop.is_set():
+            started_s = loop.time()
+            await robot.gravity_compensate(kd=0.5)
+            await asyncio.sleep(max(0.0, period_s - (loop.time() - started_s)))
+
+    def _stop_axol_teaching(self) -> bool:
+        future = self._axol_teaching_future
+        if future is None:
+            return False
+        self._axol_teaching_stop.set()
+        try:
+            future.result()
+        finally:
+            self._axol_teaching_future = None
+        return True
+    # {~.~} END: Phase 6 Axol teaching helpers.
+
     def _get_joint_positions(self) -> list[float]:
         if self.robot is None:
             raise RuntimeError("Axol robot is not initialized.")
@@ -290,6 +316,12 @@ class RobotInterface(ArmClient):
         # {~.~} START: Simplified Phase 4 close.
         if self.robot is None:
             return
+        # {~.~} START: Phase 6 teaching cleanup.
+        try:
+            self._stop_axol_teaching()
+        except Exception:
+            pass  # {~.~} Disable must still run if the teaching stream failed.
+        # {~.~} END: Phase 6 teaching cleanup.
         self.stop_recording()
         # {~.~} Axol disables the selected seven-joint arm and closes its buses.
         self._run_axol(self.robot.disable())
@@ -467,17 +499,24 @@ class RobotInterface(ArmClient):
         Returns:
             the mode/state codes so they can be inspected when debugging.
         """
-        # {~.~} START: Simplified Phase 4 position entry.
-        arm = self._require_connected_arm()  # noqa: F841
+        # {~.~} START: Phase 6 tracking-mode transition.
+        robot = self._require_connected_arm()
         if not self._axol_motion_enabled:
             # {~.~} Axol uses one realtime impedance controller for both modes.
-            self._run_axol(self.robot.enable())
+            self._run_axol(robot.enable())
             self._axol_motion_enabled = True  # {~.~} Set ownership after success.
-        if self.robot.fault is not None:
-            raise RuntimeError(f"Axol realtime core faulted: {self.robot.fault}")  # {~.~}
-        if self.robot.limp is not None:
-            raise RuntimeError(f"Axol realtime core is limp: {self.robot.limp}")  # {~.~}
-        # {~.~} END: Simplified Phase 4 position entry.
+        if robot.fault is not None:
+            raise RuntimeError(f"Axol realtime core faulted: {robot.fault}")  # {~.~}
+        if robot.limp is not None:
+            raise RuntimeError(f"Axol realtime core is limp: {robot.limp}")  # {~.~}
+        was_teaching = self._axol_teaching_future is not None
+        try:
+            self._stop_axol_teaching()
+        finally:
+            if was_teaching:
+                robot.reset_command_state()
+                self.command_servo_j(self._get_joint_positions())
+        # {~.~} END: Phase 6 tracking-mode transition.
         return 0  # {~.~} Axol has no distinct position/servo mode code.
 
     def enter_servo_mode(self) -> Optional[int | None]:
@@ -496,7 +535,7 @@ class RobotInterface(ArmClient):
         Returns:
             `bool` indicating whether manual teaching mode is implemented.
         """
-        return False  # {~.~} Phase 3: teaching command is deferred to a later phase.
+        return True  # {~.~} Phase 6: Axol streams gravity compensation for teaching.
 
     def enter_teaching_mode(self) -> Optional[int | None]:
         """Ensure the controller is set to manual teaching mode.
@@ -506,12 +545,21 @@ class RobotInterface(ArmClient):
         Returns:
             Vendor-specific mode/state code when available.
         """
-        arm = self._require_connected_arm()  # noqa: F841
+        # {~.~} START: Phase 6 Axol teaching mode.
+        future = self._axol_teaching_future
+        if future is not None and not future.done():
+            return 0
 
-        # {~.~} Enable manual teaching mode using the Axol SDK.
-
-        # {~.~} Return 0 for success - edit after implementation and testing
-        return 1
+        self.enter_position_mode()
+        robot = self._require_connected_arm()
+        if self._axol_loop is None:
+            raise RuntimeError("Axol event loop is not initialized.")
+        self._axol_teaching_stop.clear()
+        self._axol_teaching_future = asyncio.run_coroutine_threadsafe(
+            self._axol_teaching_loop(robot), self._axol_loop
+        )
+        # {~.~} END: Phase 6 Axol teaching mode.
+        return 0  # {~.~} Axol teaching cycle was submitted successfully.
 
     def supports_flange_button(self) -> bool:
         """Return whether the robot exposes a readable flange button.
