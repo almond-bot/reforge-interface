@@ -602,7 +602,7 @@
     }
   },
   "mapping_revision": {
-    "sha256": "e7dc5864d8695ebe4f27b3b294af6c87a5ed447421a95d7fefa1f17fd8a6ba9d"
+    "sha256": "1870a68e779ae3d25359fc7424320a976bce3858561793f3ac713c867225f1c5"
   },
   "ownership_origin": {
     "revision": "7ca1840d90eabe820febc4c25e279ff92e42b185",
@@ -619,6 +619,6 @@
     "url": "https://files.pythonhosted.org/packages/b9/11/4b4061f0dad7d20951e843d390b7409d4e335c259efe34de8a2f036e1152/reforge_core-2.0.22-cp311-cp311-manylinux_2_28_x86_64.whl"
   },
   "source_input_basis": "working_tree",
-  "source_revision": "6a497c3a51ca4eb6d01cf228746f789a5f91aec7",
+  "source_revision": "6b9fd36c1a27fe82401c3d1a74a4d2a6232517f1",
   "target": "trossen_arm"
 }
