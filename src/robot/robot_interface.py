@@ -3,13 +3,20 @@
 # Description: Specific code to create calibration interface for any Python Robot.
 # Version: 2.0
 
+# {~.~} START: Axol SDK imports.
+import asyncio
+import threading
 from collections.abc import Mapping
 from importlib.resources import as_file, files
 from pathlib import Path
 from typing import Literal, Optional, Sequence
 
 import numpy as np
+
+# {~.~} Import the robot SDK and required modules here.
+from almond_axol.constants import ARM_JOINTS, CAN_LEFT, CAN_RIGHT, urdf_arm_joint_names
 from almond_axol.robot import Axol
+# {~.~} END: Axol SDK imports.
 
 from reforge_core.hw_interfaces.arm_client import ArmClient
 from reforge_core.hw_interfaces.imu_recorder import ImuRecorder
@@ -25,43 +32,29 @@ from reforge_core.hw_interfaces.imu_recorder import ImuRecorder
 # 2. The REQUIRED METHODS section contains methods that must be implemented for the robot to work with the
 #    system identification and calibration workflow. The rest of the methods are pre-defined and should not
 #    need to be changed.
-# 3. The code contains examples for Standard Bots' robots, which can be used as a reference.
+# 3. Robot-specific integration points are marked in the REQUIRED METHODS section. {~.~}
 # 4. If you opt to use ROS for publishing joint positions, you can use the ros_manager.py file
 # in the robots folder. See detailed instructions in that file.
 
-# {~.~} Import robot's Python SDK with required modules here
-
-# ------------------------------- EXAMPLE -------------------------------
-# from standardbots import StandardBotsRobot, models
-# https://docs.standardbots.com/docs/latest/-/rest/intro/configuring-sdk
-# -----------------------------------------------------------------------
-
 # User constants - EDITS REQUIRED
 
+# {~.~} START: Axol arm configuration.
 # ========== BIMANUAL SPECIFIC ==============
+# Changing this flag selects the complete arm profile below.
 USE_LEFT = True
-
-# ========== LEFT ARM PARAMETERS ============
-BOT_ID = ""  # {~.~} [CHANGE TO ROBOT's ID, IF NECESSARY] - can also enter as CLI argument (see run.py --help)
-URDF_PATH = "urdf/axol-left.urdf"  # {~.~} [CHANGE TO YOUR ROBOT'S URDF FILE PATH]
-JOINTS_TARGETED = [0, 7] # for slicing joint array, e.g. q[JOINTS_TARGETED[0] : JOINTS_TARGETED[1]]
-
-# Fully stretched position of the robot for calibration.
-FULL_STRETCH_XYZ = [0.781526, 0.0, 0.0]  # {~.~} [m]
-FULL_STRETCH_QUAT = [0.0, -0.7071067812, 0.0, 0.7071067812]  # {~.~} [1]
-FULL_STRETCH_JOINTS = [0.0, -np.pi / 2, 0.0, 0.0, 0.0, 0.0, 0.0]  # {~.~} [rad]
-DEFAULT_TCP_PAYLOAD = 0.0  # {~.~} [CHANGE IF THE DEFAULT PAYLOAD IS NON_ZERO]
-
-# ========== RIGHT ARM PARAMETERS ===========
-BOT_ID = ""  if not USE_LEFT else BOT_ID # {~.~} [CHANGE TO ROBOT's ID, IF NECESSARY] - can also enter as CLI argument (see run.py --help)
-URDF_PATH = "urdf/axol-right.urdf" if not USE_LEFT else URDF_PATH  # {~.~} [CHANGE TO YOUR ROBOT'S URDF FILE PATH]
-JOINTS_TARGETED = [7, 14] if not USE_LEFT else URDF_PATH # for slicing joint array, e.g. q[JOINTS_TARGETED[0] : JOINTS_TARGETED[1]]
-
-# EXAMPLE: use ternary operators so change up top and cascades. These are loaded if file ran as a module.
-FULL_STRETCH_XYZ = [-0.781526, 0.0, 0.0] if not USE_LEFT else FULL_STRETCH_XYZ  # {~.~} [m]
-FULL_STRETCH_QUAT = [0.0, 0.7071067812, 0.0, 0.7071067812]  if not USE_LEFT else FULL_STRETCH_QUAT # {~.~} [1]
-FULL_STRETCH_JOINTS = [0.0, np.pi / 2, 0.0, 0.0, 0.0, 0.0, 0.0] if not USE_LEFT else FULL_STRETCH_JOINTS  # {~.~} [rad]
-DEFAULT_TCP_PAYLOAD = 0.0 if not USE_LEFT else DEFAULT_TCP_PAYLOAD # {~.~} [CHANGE IF THE DEFAULT PAYLOAD IS NON_ZERO]
+AXOL_SIDE = "left" if USE_LEFT else "right"
+AXOL_CAN_CHANNEL = CAN_LEFT if USE_LEFT else CAN_RIGHT
+AXOL_SDK_ARM_ATTRIBUTE = AXOL_SIDE
+AXOL_TCP_LINK = f"{AXOL_SIDE}_gripper"
+AXOL_JOINT_NAMES = tuple(joint.value for joint in ARM_JOINTS)
+AXOL_URDF_JOINT_NAMES = tuple(urdf_arm_joint_names(is_left=USE_LEFT))
+BOT_ID = ""
+URDF_PATH = f"urdf/axol-{AXOL_SIDE}.urdf"
+FULL_STRETCH_XYZ = [0.781526 if USE_LEFT else -0.781526, 0.0, 0.0]
+FULL_STRETCH_QUAT = [0.0, -0.7071067812 if USE_LEFT else 0.7071067812, 0.0, 0.7071067812]
+FULL_STRETCH_JOINTS = [0.0, -np.pi / 2 if USE_LEFT else np.pi / 2, 0.0, 0.0, 0.0, 0.0, 0.0]
+DEFAULT_TCP_PAYLOAD = 0.0
+# {~.~} END: Axol arm configuration.
 
 # ========== COMMON PARAMETERS ==============
 ROBOT_MAX_FREQ = 240  # {~.~} [CHANGE TO ROBOT'S MAX SAMPLING FREQUENCY] in [Hz]
@@ -193,80 +186,124 @@ class RobotInterface(ArmClient):
             # dynamics calls (the hardware may report extra fixed joints/grippers).
             self.num_joints = self.model.num_joints
 
+        # {~.~} START: Axol state, startup, telemetry, validation, and cleanup.
         self.use_reforge_imu = use_reforge_imu
+        self.robot: Axol | None = None
+        self._axol_loop: asyncio.AbstractEventLoop | None = None
+        self._axol_thread: threading.Thread | None = None
+        self._axol_call_lock = threading.Lock()
 
         # Reforge API and robot ID token is needed for "joint_tracker" product
         # Add it in the CLI with `--identify`
         self.reforge_api_token = api_token
         try:
-            # {~.~} Instantiate live robot mode
+            # {~.~} Instantiate live robot mode.
+            self.robot = Axol(
+                left_channel=AXOL_CAN_CHANNEL if USE_LEFT else None,
+                right_channel=None if USE_LEFT else AXOL_CAN_CHANNEL,
+                left_joints=ARM_JOINTS if USE_LEFT else None,
+                right_joints=None if USE_LEFT else ARM_JOINTS,
+                loop_hz=ROBOT_MAX_FREQ,
+            )
+            self._axol_loop = asyncio.new_event_loop()
+            self._axol_thread = threading.Thread(
+                target=self._axol_loop.run_forever,
+                name="axol-event-loop",
+                daemon=True,
+            )
+            self._axol_thread.start()
 
-            # ------------------- EXAMPLE --------------------
-            # self.robot = StandardBotsRobot(
-            #     url=robot_ip,
-            #     token=sdk_token,
-            #     robot_kind=StandardBotsRobot.RobotKind.Live,
-            # )
-            # ------------------------------------------------
+            # {~.~} Enable ROS control, if necessary.
+            # This Axol integration does not require a ROS-control transition.
+            self._run_axol(self.robot.connect())
+            self._run_axol(
+                self.robot.start_telemetry(ROBOT_MAX_FREQ, torque=True)
+            )
+            self._run_axol(self.robot.wait_for_telemetry())
+            active_arm = self.robot.left if USE_LEFT else self.robot.right
+            inactive_arm = self.robot.right if USE_LEFT else self.robot.left
+            if active_arm is None or inactive_arm is not None:
+                raise RuntimeError("Axol did not isolate the selected arm.")
 
-            # {~.~} Enable ROS control, if necessary
-            # [YOUR CODE HERE]
-
-            # ------------------------------ EXAMPLE -------------------------------
-            # with self.robot.connection():
-            #     ## Set teleoperation/ROS control state
-            #     self.robot.ros.control.update_ros_control_state(
-            #         models.ROSControlUpdateRequest(
-            #             action=models.ROSControlStateEnum.Enabled,
-            #             # to disable: action=models.ROSControlStateEnum.Disabled,
-            #         )
-            #     )
-
-            #     # Get teleoperation state
-            #     self.state = self.robot.ros.status.get_ros_control_state().ok()
-            #     # Enable the robot, make sure the E-stop is released before enabling
-            #     print("Enabling live robot...")
-            # -----------------------------------------------------------------------
-
-            # {~.~} Unbrake the robot if not operational
-            # [YOUR CODE HERE]
-
-            # --------------- EXAMPLE -----------------
-            # self.robot.movement.brakes.unbrake().ok()
-            # -----------------------------------------
-
-            # Set ID for robot
+            # {~.~} Unbrake the robot if not operational.
+            # Initialization remains non-actuating; torque control is handled later.
             self.id = robot_id
-
-            # Should be equivalent to Dynamics model joints
             num_joints_sdk = len(self._get_joint_positions())
             if num_joints_sdk != self.num_joints:
                 raise RuntimeError(
-                    f"Number of robot joints in URDF ({self.num_joints}) is not equivalent to the number"
-                    f"of joints returned by the robot SDK ({num_joints_sdk})."
+                    f"Number of robot joints in URDF ({self.num_joints}) is not "
+                    f"equivalent to the number returned by Axol ({num_joints_sdk})."
                 )
-            self.pose_length = len(self.get_tcp_pose())
+            self.pose_length = 7
 
-        except Exception as e:
-            # Print exception error message
-            raise RuntimeError(f"Error getting {robot_ip} operational: {str(e)}")
+        except BaseException as error:
+            self._cleanup_axol_after_error(error)
+            if isinstance(error, Exception):
+                raise RuntimeError(
+                    f"Error getting {robot_ip} operational: {error}"
+                ) from error
+            raise
 
-        if not self.imu_manager_is_loaded:
-            selected_imu_recorder = imu_recorder
-            if selected_imu_recorder is None and not self.use_reforge_imu:
-                selected_imu_recorder = self.create_robot_imu_recorder()
-            self.use_reforge_imu = selected_imu_recorder is None
-            self.arm_imu_manager = self.initialize_arm_imu_manager(
-                arm_sample_time_s=1.0 / ROBOT_MAX_FREQ,
-                imu_record_mode=imu_record_mode,
-                imu_comm_mode=imu_comm_mode,
-                imu_record_frequency_hz=imu_record_frequency_hz,
-                imu_recorder=selected_imu_recorder,
-            )
+        try:
+            if not self.imu_manager_is_loaded:
+                selected_imu_recorder = imu_recorder
+                if selected_imu_recorder is None and not self.use_reforge_imu:
+                    selected_imu_recorder = self.create_robot_imu_recorder()
+                self.use_reforge_imu = selected_imu_recorder is None
+                self.arm_imu_manager = self.initialize_arm_imu_manager(
+                    arm_sample_time_s=1.0 / ROBOT_MAX_FREQ,
+                    imu_record_mode=imu_record_mode,
+                    imu_comm_mode=imu_comm_mode,
+                    imu_record_frequency_hz=imu_record_frequency_hz,
+                    imu_recorder=selected_imu_recorder,
+                )
+        except BaseException as error:
+            self._cleanup_axol_after_error(error)
+            raise
 
-    # {~.~} Add any necessary machinery for asynchronous operation below until the next {~.~} marker 
-    
-    # {~.~} All infrastructure for asynchronous operation should be above this line. 
+        # {~.~} END: Axol state, startup, telemetry, validation, and cleanup.
+    # {~.~} START: Asynchronous Axol helpers and close.
+    def _cleanup_axol_after_error(self, error: BaseException) -> None:
+        try:
+            self.close()
+        except BaseException as cleanup_error:
+            error.add_note(f"Axol cleanup failed: {cleanup_error}")
+
+    def _run_axol(self, coroutine) -> object:
+        if self._axol_loop is None:
+            raise RuntimeError("Axol event loop is not initialized.")
+        with self._axol_call_lock:
+            return asyncio.run_coroutine_threadsafe(
+                coroutine, self._axol_loop
+            ).result()
+
+    def _get_joint_positions(self) -> list[float]:
+        if self.robot is None:
+            raise RuntimeError("Axol robot is not initialized.")
+        arm = self.robot.left if USE_LEFT else self.robot.right
+        if arm is None:
+            raise RuntimeError(f"No {AXOL_SIDE} Axol arm is available.")
+        return np.asarray(arm.positions, dtype=float)[: self.num_joints].tolist()
+
+    def close(self) -> None:
+        """Stop recording and cleanly close the Axol async loop."""
+        if self.robot is None:
+            return
+        self.stop_recording()
+        self._run_axol(self.robot.disconnect())
+        if self._axol_loop is not None:
+            self._axol_loop.call_soon_threadsafe(self._axol_loop.stop)
+        if self._axol_thread is not None:
+            self._axol_thread.join()
+            if self._axol_thread.is_alive():
+                raise RuntimeError("Axol event-loop thread did not stop.")
+        if self._axol_loop is not None:
+            self._axol_loop.close()
+        self.robot = None
+        self._axol_loop = None
+        self._axol_thread = None
+
+    # {~.~} END: Asynchronous Axol helpers and close.
 
     def create_robot_imu_recorder(self) -> ImuRecorder:
         """Create the robot-native IMU adapter used when Reforge IMU is disabled.
@@ -332,17 +369,8 @@ class RobotInterface(ArmClient):
             target_joints = list(np.rad2deg(angle) for angle in target_joints)
 
         arm = self._require_connected_arm()  # noqa: F841
-        # ------------------------------------ EXAMPLE -------------------------------------
-        # update_request = models.ArmPositionUpdateRequest(
-        #     kind=models.ArmPositionUpdateRequestKindEnum.JointRotation,
-        #     joint_rotation=models.ArmJointRotations(
-        #         joints=target_joint)
-        # )
-
-        # response = arm.movement.position.set_arm_position(body=update_request).ok()
-        # ----------------------------------------------------------------------------------
-
-        # {~.~} Return 0 for success - edit after implementation and testing
+        # {~.~} Send a joint target through the selected Axol arm.
+        # {~.~} Replace the placeholder return after implementation and testing.
         return 1
 
     def command_move_pose(
@@ -372,36 +400,8 @@ class RobotInterface(ArmClient):
             raise RuntimeError("locked_joints is only supported in simulator mode.")
 
         arm = self._require_connected_arm()  # noqa: F841
-
-        # ---------------------------------- EXAMPLE ------------------------------------
-        # quatx, quaty, quatz, quatw = target_quat
-        # move_quat = models.Orientation(
-        #                 kind=models.OrientationKindEnum.Quaternion,
-        #                 quaternion=models.Quaternion(x=quatx,
-        #                                              y=quaty,
-        #                                              z=quatz,
-        #                                              w=quatw
-        #                                              ),
-        #             )
-        # x, y, z = target_xyz
-        # move_xyz = models.Position(
-        #                 unit_kind=models.LinearUnitKind.Meters,
-        #                 x=x,
-        #                 y=y,
-        #                 z=z
-        #             )
-
-        # update_request = models.ArmPositionUpdateRequest(
-        #     kind=models.ArmPositionUpdateRequestKindEnum.TooltipPosition,
-        #     tooltip_position=models.PositionAndOrientation(
-        #         position=move_xyz,
-        #         orientation=move_quat)
-        # )
-
-        # response = arm.movement.position.set_arm_position(body=update_request).ok()
-        # ----------------------------------------------------------------------------------
-
-        # {~.~} Return 0 for success - edit after implementation and testing
+        # {~.~} Send a Cartesian target through the selected Axol arm.
+        # {~.~} Replace the placeholder return after implementation and testing.
         return 1
 
     def command_servo_j(
@@ -424,21 +424,8 @@ class RobotInterface(ArmClient):
         """
         arm = self._require_connected_arm()  # noqa: F841
 
-        # {~.~} Publish joint positions to the robot
-        # [YOUR CODE HERE -- see example below]
-
-        # ------------------------------ EXAMPLE ------------------------------
-        # cmd_q = list(q)
-        # if IS_DEGREES:
-        #     cmd_q = [np.rad2deg(value) for value in cmd_q]
-
-        # code = arm.set_servo_angle_j(
-        #     angles=cmd_q,
-        #     wait=wait,
-        # )
-        # ---------------------------------------------------------------------
-
-        # {~.~} Return 0 for success - edit after implementation and testing
+        # {~.~} Publish joint positions to the selected Axol arm.
+        # {~.~} Replace the placeholder return after implementation and testing.
         return 1
 
     def enter_position_mode(self) -> Optional[int | None]:
@@ -450,14 +437,8 @@ class RobotInterface(ArmClient):
         """
         arm = self._require_connected_arm()  # noqa: F841
 
-        # ------------------------------ EXAMPLE ------------------------------
-        # arm.clean_error()
-        # arm.clean_warn()
-        # code_mode = arm.set_mode(0) # 0 = position mode
-        # code_state = arm.set_state(0) # start
-        # ----------------------------------------------------------------------
-
-        # {~.~} Return 0 for success - edit after implementation and testing
+        # {~.~} Select the Axol point-to-point control mode.
+        # {~.~} Replace the placeholder return after implementation and testing.
         return 0
 
     def enter_servo_mode(self) -> Optional[int | None]:
@@ -468,13 +449,8 @@ class RobotInterface(ArmClient):
         """
         arm = self._require_connected_arm()  # noqa: F841
 
-        # ------------------------------ EXAMPLE ------------------------------
-        # code_en = arm.motion_enable(enable=True)
-        # code_mode = arm.set_mode(1)  # 1 = servo mode
-        # code_state = arm.set_state(0)  # start
-        # ----------------------------------------------------------------------
-
-        # {~.~} Return 0 for success - edit after implementation and testing
+        # {~.~} Select the Axol servo control mode.
+        # {~.~} Replace the placeholder return after implementation and testing.
         return 0
 
     def supports_teaching_mode(self) -> bool:
@@ -497,9 +473,7 @@ class RobotInterface(ArmClient):
         """
         arm = self._require_connected_arm()  # noqa: F841
 
-        # {~.~} Enable manual teaching mode using the robot SDK.
-        # [YOUR CODE HERE]
-        arm.robot.gravity.GravityCompensator
+        # {~.~} Enable manual teaching mode using the Axol SDK.
 
         # {~.~} Return 0 for success - edit after implementation and testing
         return 1
@@ -525,8 +499,7 @@ class RobotInterface(ArmClient):
         """
         arm = self._require_connected_arm()  # noqa: F841
 
-        # {~.~} Read the flange-button state using the robot SDK.
-        # [YOUR CODE HERE]
+        # {~.~} Read the flange-button state using the Axol SDK.
 
         return False
 
@@ -542,15 +515,7 @@ class RobotInterface(ArmClient):
         qd: list[float] = []
         tau: list[float] = []
 
-        # ------------------------------ EXAMPLE ------------------------------
-        # code, payload = arm.get_joint_states()
-        # if code != 0:
-        #     raise RuntimeError(f"get_joint_states returned code {code}")
-        # q, qd, tau = payload
-        # q = list(q[: self.num_joints])
-        # qd = list(qd[: self.num_joints])
-        # tau = list(tau[: self.num_joints])
-        # ----------------------------------------------------------------------
+        # {~.~} Read joint position, velocity, and effort from the selected Axol arm.
 
         if not IS_DEGREES:
             q = [np.deg2rad(value) for value in q]
@@ -569,27 +534,7 @@ class RobotInterface(ArmClient):
         quat: list[float] = []
         arm = self._require_connected_arm()  # noqa: F841
 
-        # ------------------------------ EXAMPLE ------------------------------
-        # code, pose = arm.get_position_aa()
-
-        # if code != 0:
-        #     raise Exception(f"Unreliable TCP pose! Return code {code}")
-
-        # # Additional operations may be needed depending on pose return style
-        # # Decompose pose if necessary
-        # position, axang = pose[:3], pose[3:]
-
-        # # Convert position coordinates to meters
-        # position = [coord / 1000.0 for coord in position]
-
-        # # Convert rotation coordinates to radians, if necessary
-        # if not IS_DEGREES:
-        #     axang = [np.deg2rad(coord) for coord in axang]
-
-        # # Convert axis-angle to quaternion
-        # from scipy.spatial.transform import Rotation as R
-        # quat = R.from_rotvec(axang).as_quat().tolist()
-        # ----------------------------------------------------------------------
+        # {~.~} Read and normalize the selected Axol TCP pose.
 
         # Return tooltip pose as a list
         return [*position, *quat]
