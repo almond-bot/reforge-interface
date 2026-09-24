@@ -13,7 +13,7 @@ from rclpy.timer import Timer
 from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
 from sensor_msgs.msg import JointState, Imu
 from builtin_interfaces.msg import Duration as DurationMsg
-from robot.ros_topics import (
+from .ros_topics import (
     IMU_TOPIC_TEMPLATE,
     JOINT_COMMAND_TOPIC_TEMPLATE,
     JOINT_STATE_TOPIC_TEMPLATE,

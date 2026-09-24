@@ -6,8 +6,8 @@ if [[ "${DEBUG:-0}" == "1" ]]; then
 fi
 
 usage() {
-  echo "Usage: $0 <robot_ip> <data_folder> --robot_id <robot_id> [vibration_test flags]"
-  echo "Example: $0 cb2002.sb.app ./src/robot/data/2026-2-25 --sdk_token <token> --robot_id <id> --freq 200"
+  echo "Usage: $0 <robot_ip> <data_folder> [vibration_test flags]"
+  echo "Example: $0 cb2002.sb.app src/robot/data/2026-2-25 --sdk_token <token> --robot_id <id> --freq 200"
 }
 
 if [[ $# -lt 2 ]]; then
@@ -23,63 +23,24 @@ if [[ ! -d "$host_data_folder" ]]; then
   echo "Data folder does not exist: $host_data_folder"
   exit 1
 fi
+host_data_folder="$(cd -- "$host_data_folder" && pwd -P)"
 
-IMAGE_NAME="${IMAGE_NAME:-reforge-interface:latest}"
+IMAGE_NAME="${IMAGE_NAME:-reforge-interface}"
 CONTAINER_NAME="${CONTAINER_NAME:-reforge-vibration-test}"
-CONTAINER_DATA_DIR="${CONTAINER_DATA_DIR:-/control-box-bot/reforge-interface/src/robot/data}"
-DEFAULT_CYCLONEDDS_PATH="/etc/standardbots/configuration/cyclonedds.xml"
-CYCLONEDDS_URI="${CYCLONEDDS_URI:-}"
+MODELS_DIR="${MODELS_DIR:-$(pwd)/src/robot/models}"
+CONTAINER_DATA_DIR="${CONTAINER_DATA_DIR:-/opt/reforge-interface/src/robot/data}"
+CONTAINER_MODELS_DIR="/opt/reforge-interface/src/robot/models"
 
-normalize_cyclonedds() {
-  local input="$1"
-  local path=""
-  local uri=""
-  if [[ "$input" == file://* ]]; then
-    path="${input#file://}"
-    uri="$input"
-  else
-    path="$input"
-    uri="file://$input"
-  fi
-  printf '%s\n%s\n' "$path" "$uri"
-}
+mkdir -p -- "$MODELS_DIR"
+MODELS_DIR="$(cd -- "$MODELS_DIR" && pwd -P)"
 
 cmd_args=(python3 -m robot.run vibration_test "$robot_ip" "$CONTAINER_DATA_DIR")
 if [[ $# -gt 0 ]]; then
   cmd_args+=("$@")
 fi
 
-docker_args=(
-  --net=host
-  --rm
-  --name "$CONTAINER_NAME"
-  -v "$host_data_folder:$CONTAINER_DATA_DIR"
-)
-
-cyclonedds_input="$CYCLONEDDS_URI"
-if [[ -z "$cyclonedds_input" && -f "$DEFAULT_CYCLONEDDS_PATH" ]]; then
-  cyclonedds_input="$DEFAULT_CYCLONEDDS_PATH"
-fi
-
-if [[ -n "$cyclonedds_input" ]]; then
-  mapfile -t cyclonedds_cfg < <(normalize_cyclonedds "$cyclonedds_input")
-  cyclonedds_path="${cyclonedds_cfg[0]}"
-  cyclonedds_uri="${cyclonedds_cfg[1]}"
-  if [[ -f "$cyclonedds_path" ]]; then
-    cyclonedds_dir="$(dirname "$cyclonedds_path")"
-    docker_args+=(
-      -v "$cyclonedds_dir:$cyclonedds_dir:ro"
-      -e "CYCLONEDDS_URI=$cyclonedds_uri"
-    )
-  else
-    echo "Warning: CYCLONEDDS config not found on host: $cyclonedds_input"
-    echo "Vibration test will run without explicit CYCLONEDDS_URI."
-  fi
-else
-  echo "Info: CYCLONEDDS_URI is not set and no default config was found."
-  echo "Vibration test will run with CycloneDDS defaults."
-fi
-
-docker run "${docker_args[@]}" \
+docker run --net=host --rm --name "$CONTAINER_NAME" \
+  -v "$host_data_folder:$CONTAINER_DATA_DIR" \
+  -v "$MODELS_DIR:$CONTAINER_MODELS_DIR" \
   "$IMAGE_NAME" \
   "${cmd_args[@]}"

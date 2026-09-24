@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import threading
 import time
 from collections import deque
@@ -10,7 +11,7 @@ from typing import Any
 from reforge_core.hw_interfaces.arm_client import ArmClient
 from reforge_core.hw_interfaces.imu_recorder import ImuRecorder
 from reforge_core.imu.data import IMUState, IMUStateTraj
-from robot.ros_topics import IMU_TOPIC_TEMPLATE
+from .ros_topics import IMU_TOPIC_TEMPLATE
 
 DEFAULT_ROS_IMU_TOPIC_TEMPLATE = IMU_TOPIC_TEMPLATE
 ROS_UNIX_TIMESTAMP_MINIMUM_S = 946684800.0
@@ -102,6 +103,7 @@ class RosImuRecorder(ImuRecorder):
         self.topic = topic_template.replace("<BOT_ID>", bot_id)
         self.ready_timeout_s = float(ready_timeout_s)
         self._is_prepared = False
+        self._recording_frequency_hz: float | None = None
         self._is_recording = False
         self._latest_state: IMUState | None = None
         self._recorded_states: deque[IMUState] = deque()
@@ -122,6 +124,27 @@ class RosImuRecorder(ImuRecorder):
             None.
         """
         return self._is_prepared
+
+    @property
+    def recording_frequency_hz(self) -> float:
+        """Return the arm frequency used for this ROS recording session.
+
+        ROS does not expose a separate native IMU rate through this helper.
+        The effective rate is therefore the arm recording frequency supplied
+        by :meth:`prepare`; querying it before preparation is an invalid use
+        of the recorder contract.
+
+        Returns:
+            Effective ROS IMU recording frequency [Hz].
+
+        Raises:
+            RuntimeError: If preparation has not supplied an effective rate.
+        """
+        if self._recording_frequency_hz is None:
+            raise RuntimeError(
+                "ROS IMU recording frequency is unavailable before prepare()."
+            )
+        return self._recording_frequency_hz
 
     def prepare(
         self,
@@ -145,21 +168,33 @@ class RosImuRecorder(ImuRecorder):
             RuntimeError: If ROS dependencies are missing or no IMU sample
                 arrives before `ready_timeout_s`.
         """
-        del arm, arm_recording_hz
+        del arm
         if self._is_prepared and not force_recalibration:
             return
+
+        # A preparation attempt is transactional: frequency and readiness
+        # become observable only after a subscription has received a sample.
+        # Clear both values before forced re-preparation so a failed attempt
+        # cannot expose the previous session's state.
+        with self._lock:
+            self._latest_state = None
+            self._recording_frequency_hz = None
+            self._is_prepared = False
         if force_recalibration:
             self._close_ros_node()
+        effective_frequency_hz = float(arm_recording_hz)
+        if not math.isfinite(effective_frequency_hz) or effective_frequency_hz <= 0.0:
+            raise ValueError("arm_recording_hz must be finite and greater than zero.")
         self._ensure_ros_subscription()
         deadline_s = time.time() + self.ready_timeout_s
 
         # Wait for the subscription callback to receive at least one sample.
         while time.time() < deadline_s:
             with self._lock:
-                has_latest_state = self._latest_state is not None
-            if has_latest_state:
-                self._is_prepared = True
-                return
+                if self._latest_state is not None:
+                    self._recording_frequency_hz = effective_frequency_hz
+                    self._is_prepared = True
+                    return
             time.sleep(ROS_SPIN_PERIOD_S)
         raise RuntimeError(
             f"No ROS IMU samples received on topic '{self.topic}' within "
@@ -300,4 +335,7 @@ class RosImuRecorder(ImuRecorder):
         if self._node is not None:
             self._node.destroy_node()
             self._node = None
-        self._is_prepared = False
+        with self._lock:
+            self._latest_state = None
+            self._recording_frequency_hz = None
+            self._is_prepared = False
