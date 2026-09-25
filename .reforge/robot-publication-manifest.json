@@ -485,10 +485,10 @@
     },
     "src/robot/robot_interface.py": {
       "mode": 420,
-      "sha256": "f0c8f343a11728f74d7dd2685cc364dd3daf789d21fa98d138fd936fb853c52e",
+      "sha256": "9c053c4c2c02632c85d5dbf2372eda484f0a0d1282c72e2e244c91fa1a29b69c",
       "sources": [
         {
-          "sha256": "f0c8f343a11728f74d7dd2685cc364dd3daf789d21fa98d138fd936fb853c52e"
+          "sha256": "9c053c4c2c02632c85d5dbf2372eda484f0a0d1282c72e2e244c91fa1a29b69c"
         }
       ]
     },
@@ -591,6 +591,6 @@
     "url": "https://files.pythonhosted.org/packages/b9/11/4b4061f0dad7d20951e843d390b7409d4e335c259efe34de8a2f036e1152/reforge_core-2.0.22-cp311-cp311-manylinux_2_28_x86_64.whl"
   },
   "source_input_basis": "working_tree",
-  "source_revision": "c3d568620f85b4c07a06a7aa165e7a7d3aae4f22",
+  "source_revision": "cd97080cf36e0b06accdd3f79435594d9bc311f4",
   "target": "denso_bcap"
 }
