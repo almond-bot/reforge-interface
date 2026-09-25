@@ -575,7 +575,7 @@
     }
   },
   "mapping_revision": {
-    "sha256": "bbe1f104ef424f5d3d67e7fbbcf9efa77a79187c503bc7fa02e20e6d55bbc382"
+    "sha256": "f2996c238d94257f82be1be0df7a7f8cb2b4f81e770729b511c14e544b680ea5"
   },
   "ownership_origin": {
     "revision": "d377c58d26960214e707dc137913433ddee9e5e7",
@@ -583,7 +583,6 @@
   },
   "public_limitations": "The COBOTTA PRO 900 URDF and 14 DAE meshes are bundled. The vendored ORiN b-CAP client retains its MIT license and pinned provenance; inclusion does not claim live-hardware or KineCal qualification.",
   "publication_enabled": true,
-  "readiness": "publication_ready",
   "repository": "reforge-robotics/reforge-interface",
   "schema_version": 1,
   "sdk_candidate": {
@@ -592,6 +591,6 @@
     "url": "https://files.pythonhosted.org/packages/b9/11/4b4061f0dad7d20951e843d390b7409d4e335c259efe34de8a2f036e1152/reforge_core-2.0.22-cp311-cp311-manylinux_2_28_x86_64.whl"
   },
   "source_input_basis": "working_tree",
-  "source_revision": "8565e1b41abd7ab8dacbd5861fa9281fe20fa782",
+  "source_revision": "c3d568620f85b4c07a06a7aa165e7a7d3aae4f22",
   "target": "denso_bcap"
 }
