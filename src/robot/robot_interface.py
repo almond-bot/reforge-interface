@@ -40,7 +40,7 @@ BOT_ID = "" if USE_LEFT else ""
 URDF_PATH = f"urdf/axol-{AXOL_SIDE}.urdf"
 FULL_STRETCH_XYZ = [0.0, 0.0, 0.781526]
 FULL_STRETCH_QUAT = [0.0, 1.0, 0.0, 0.0]
-FULL_STRETCH_JOINTS = [0.0, -np.pi / 2 if USE_LEFT else np.pi / 2, 0.0, 0.0, 0.0, 0.0, 0.0]
+FULL_STRETCH_JOINTS = [0.0, np.pi / 2, 0.0, 0.0, 0.0, 0.0, 0.0]
 DEFAULT_TCP_PAYLOAD = 0.0
 
 # ========== COMMON PARAMETERS ==============
