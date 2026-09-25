@@ -4,12 +4,22 @@
 # Version: 2.0
 
 
+import sys
 from collections.abc import Mapping
 from importlib.resources import as_file, files
 from pathlib import Path
 from typing import Literal, Optional, Sequence
 
 import numpy as np
+
+# almond-axol requires Python 3.12+. On 3.11, asyncio.wait_for can swallow a
+# task cancellation, so the SDK's motor telemetry loops never stop and
+# disconnect()/enable() hang.
+if sys.version_info < (3, 12):
+    raise RuntimeError(
+        "The Axol interface requires Python 3.12+ (almond-axol's minimum); "
+        f"this is Python {sys.version.split()[0]}."
+    )
 
 # Almond SDK imports including async libraries
 from almond_axol.constants import ARM_JOINTS, CAN_LEFT, CAN_RIGHT, urdf_arm_joint_names
