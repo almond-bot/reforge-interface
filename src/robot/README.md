@@ -71,6 +71,32 @@ If a field is unavailable, keep the key and set an empty value.
 
 ## Commands
 
+### Prepare a bimanual URDF once
+
+Run the splitter once as standalone robot-asset preparation. Identify the first
+actuator joint for each arm; use the optional end-joint arguments only when an
+arm path branches. Selecting these generated assets in `robot.run` is a separate
+runtime-integration step.
+
+```bash
+python3 -m robot.split_urdf split src/robot/urdf/my_robot.urdf \
+  --left-first-joint <left_first_joint> \
+  --right-first-joint <right_first_joint>
+```
+
+Every non-root link must have mesh-backed `<visual>` and `<collision>` elements;
+an empty graph-root link is allowed. Relative and `package://PACKAGE/...` mesh
+paths are resolved from the source URDF directory and written as filesystem
+paths only in the generated files. The source URDF is not changed.
+
+The command writes `my_robot-left.urdf`, `my_robot-right.urdf`, and
+`my_robot.json` beside the source. The JSON contains each arm's URDF path, TCP
+link, active joint order, and deterministic cardinal-axis full-stretch joint,
+XYZ, and XYZW quaternion values. Full stretch keeps downstream joints at their
+URDF zero configuration and rotates the root actuator toward the reachable
+`+X`, `-X`, `+Y`, and `-Y` directions before selecting the farthest. Pass
+`--force` to regenerate all three files.
+
 ### 5-Minute Adapter Happy Path
 
 ```bash
