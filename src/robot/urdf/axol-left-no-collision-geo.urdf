@@ -14,12 +14,6 @@
                 <color rgba="0.647059 0.647059 0.647059 1" />
             </material>
         </visual>
-        <collision>
-            <origin xyz="0 0 0" rpy="0 -0 0" />
-            <geometry>
-                <mesh filename="/home/reforge/Desktop/almond/reforge-interface/src/robot/urdf/meshes/Base.stl" scale="1 1 1" />
-            </geometry>
-        </collision>
     </link>
     <link name="left_e1">
         <inertial>
@@ -389,12 +383,6 @@
                 <color rgba="0.615686 0.811765 0.929412 1" />
             </material>
         </visual>
-        <collision>
-            <origin xyz="2.78001e-17 0 0.06" rpy="0 -0 0" />
-            <geometry>
-                <mesh filename="/home/reforge/Desktop/almond/reforge-interface/src/robot/urdf/meshes/S1.stl" scale="1 1 1" />
-            </geometry>
-        </collision>
     </link>
     <link name="__split_left_arm_base" />
     <joint name="base_0" type="fixed">

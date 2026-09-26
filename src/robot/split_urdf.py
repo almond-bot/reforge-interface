@@ -1,36 +1,68 @@
 #!/usr/bin/env python3
-"""Validate and split a bimanual URDF into one model per arm.
+"""Split a bimanual URDF into left- and right-arm models and write their poses.
 
-The operator identifies the first actuator joint for each arm and, when a
-subtree branches, the final joint on each selected arm path. Each generated
-URDF retains the complete source robot, keeps the selected arm's supported
-one-degree-of-freedom joints movable, and fixes every other movable joint at
-the URDF zero configuration.
+This splitter deliberately does not infer arm membership from joint or link names.
+The operator identifies the first actuator joint for each arm.  Descendant
+joints are followed until the chain ends.  If a link has multiple child joints,
+the operator must identify the last joint belonging to the arm (or provide it
+with ``--left-end-joint`` / ``--right-end-joint``).
 
-Generated models are rooted at the selected first actuator. Relative and
-``package://`` mesh references are resolved against the source URDF and are
-rewritten as absolute paths only in generated trees.
+Each generated URDF retains every original link, visual, and collision element.
+Only revolute joints on the selected arm path remain movable.  Every other
+movable joint, including continuous and prismatic joints, is converted to a
+fixed joint at its URDF zero position.
+
+The generated URDF root is a new massless link whose origin is coincident with
+the selected first actuator's joint origin at zero position.  Its orientation
+is chosen so that the first actuator's axis is parallel to world Z, with its
+positive direction along world -Z.  The Axol arm therefore extends above the
+world z=0 plane, toward world +Z.
+A fixed joint connects that new root to the complete original robot.  The torso
+and inactive arm consequently remain stationary collision geometry.
+World-frame pose constants used with a generated model must therefore be
+re-expressed in that model's new root frame.
+
+Example::
+
+    python3 -m robot.split_urdf split src/robot/urdf/axol.urdf \
+        --left-first-joint left_s1_0 \
+        --right-first-joint right_s1_0 \
+        --visualize
+
+Existing generated URDFs can be viewed without splitting them again::
+
+    python3 -m robot.split_urdf simulate \
+        src/robot/urdf/axol-left.urdf \
+        src/robot/urdf/axol-right.urdf
+
+For compatibility, the original command form without the explicit ``split``
+subcommand remains supported.
+
+Full-stretch poses are computed from four cardinal configurations with Reforge
+core forward kinematics.  The optional viewer requires ``viser[urdf]``.  The
+script expects a URDF, not a xacro file, and assumes the URDF describes one
+connected tree.
 """
 
 from __future__ import annotations
 
 import argparse
 import copy
+import json
 import math
 import re
 import sys
 from collections import defaultdict
-from collections.abc import Iterator, Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TypeAlias
+from typing import TypeAlias, cast
 from xml.etree import ElementTree as ET
 
 Matrix4: TypeAlias = list[list[float]]
+ManifestEntry: TypeAlias = dict[str, str | list[str] | list[float]]
+SplitManifest: TypeAlias = dict[str, ManifestEntry]
 
-_ACTIVE_JOINT_TYPES = {"continuous", "prismatic", "revolute"}
-_KNOWN_JOINT_TYPES = _ACTIVE_JOINT_TYPES | {"fixed", "floating", "planar"}
-_UNSUPPORTED_JOINT_TYPES = {"floating", "planar"}
+_MOVABLE_JOINT_TYPES = {"continuous", "floating", "planar", "prismatic", "revolute"}
 _FIXED_JOINT_FIELDS = {
     "axis",
     "calibration",
@@ -39,15 +71,32 @@ _FIXED_JOINT_FIELDS = {
     "mimic",
     "safety_controller",
 }
+_MANIFEST_ENTRY_FIELDS = {
+    "urdf_path",
+    "tcp_link",
+    "active_joint_order",
+    "full_stretch_joints",
+    "full_stretch_xyz",
+    "full_stretch_quat",
+}
+_CARDINAL_DIRECTIONS = (
+    (0, 1.0, 0.0),
+    (0, -1.0, math.pi),
+    (1, 1.0, math.pi / 2.0),
+    (1, -1.0, -math.pi / 2.0),
+)
+_DIRECTION_TIE_TOLERANCE_M = 1e-9
+_CARDINAL_ALIGNMENT_TOLERANCE_M = 1e-6
+_JOINT_LIMIT_TOLERANCE_RAD = 1e-9
 
 
 class SplitError(ValueError):
-    """Indicate that a source URDF or arm selection cannot be split safely."""
+    """Raised when the source URDF or requested arm selection is ambiguous."""
 
 
 @dataclass(frozen=True)
 class UrdfGraph:
-    """Store the validated link/joint topology needed by the splitter."""
+    """The link/joint topology needed by the splitter."""
 
     root_link: str
     links: dict[str, ET.Element]
@@ -57,39 +106,8 @@ class UrdfGraph:
 
 
 @dataclass(frozen=True)
-class MeshReference:
-    """Describe one validated mesh reference and its resolved filesystem path."""
-
-    link_name: str
-    geometry_kind: str
-    geometry_index: int
-    filename: str
-    resolved_path: Path
-
-    @property
-    def context(self) -> str:
-        """Return a human-readable XML location for diagnostics."""
-
-        return (
-            f"link {self.link_name!r} <{self.geometry_kind}>"
-            f"[{self.geometry_index}] <mesh>"
-        )
-
-
-@dataclass(frozen=True)
-class ValidationReport:
-    """Contain a parsed source URDF and all successful validation results."""
-
-    source_path: Path
-    tree: ET.ElementTree
-    graph: UrdfGraph
-    mesh_references: tuple[MeshReference, ...]
-    package_roots: tuple[tuple[str, Path], ...]
-
-
-@dataclass(frozen=True)
 class ArmSelection:
-    """Describe the resolved kinematic path for one generated arm model."""
+    """Resolved path and independently movable joints for one output model."""
 
     label: str
     first_joint: str
@@ -97,28 +115,7 @@ class ArmSelection:
     active_joints: tuple[str, ...]
 
 
-@dataclass(frozen=True)
-class GeneratedArm:
-    """Contain one generated arm tree and its deliberate topology changes."""
-
-    selection: ArmSelection
-    tree: ET.ElementTree
-    frozen_joints: tuple[str, ...]
-    removed_transmissions: tuple[str, ...]
-
-
-@dataclass(frozen=True)
-class SplitResult:
-    """Contain validated left and right outputs generated from one source URDF."""
-
-    source: ValidationReport
-    left: GeneratedArm
-    right: GeneratedArm
-
-
 def _joint_parent(joint: ET.Element) -> str:
-    """Return a joint's parent link name after validating the element."""
-
     parent = joint.find("parent")
     if parent is None or not parent.get("link"):
         raise SplitError(f"Joint {joint.get('name')!r} has no valid <parent link=...>.")
@@ -126,8 +123,6 @@ def _joint_parent(joint: ET.Element) -> str:
 
 
 def _joint_child(joint: ET.Element) -> str:
-    """Return a joint's child link name after validating the element."""
-
     child = joint.find("child")
     if child is None or not child.get("link"):
         raise SplitError(f"Joint {joint.get('name')!r} has no valid <child link=...>.")
@@ -135,8 +130,6 @@ def _joint_child(joint: ET.Element) -> str:
 
 
 def _build_graph(robot: ET.Element) -> UrdfGraph:
-    """Build and validate a connected, acyclic URDF link/joint tree."""
-
     links: dict[str, ET.Element] = {}
     for link in robot.findall("link"):
         name = link.get("name")
@@ -145,8 +138,6 @@ def _build_graph(robot: ET.Element) -> UrdfGraph:
         if name in links:
             raise SplitError(f"Duplicate link name: {name!r}.")
         links[name] = link
-    if not links:
-        raise SplitError("The URDF must contain at least one <link>.")
 
     joints: dict[str, ET.Element] = {}
     outgoing: dict[str, list[ET.Element]] = defaultdict(list)
@@ -157,17 +148,6 @@ def _build_graph(robot: ET.Element) -> UrdfGraph:
             raise SplitError("Every <joint> must have a name.")
         if name in joints:
             raise SplitError(f"Duplicate joint name: {name!r}.")
-        joint_type = joint.get("type")
-        if joint_type not in _KNOWN_JOINT_TYPES:
-            raise SplitError(
-                f"Joint {name!r} has unknown or missing type {joint_type!r}."
-            )
-        if joint_type in _UNSUPPORTED_JOINT_TYPES:
-            raise SplitError(
-                f"Joint {name!r} uses unsupported {joint_type!r} motion; "
-                "only fixed and one-degree-of-freedom joints are supported."
-            )
-
         parent = _joint_parent(joint)
         child = _joint_child(joint)
         if parent not in links:
@@ -192,6 +172,8 @@ def _build_graph(robot: ET.Element) -> UrdfGraph:
             f"found {len(roots)} candidate root links: {roots}."
         )
 
+    # A traversal catches cycles and disconnected components that the root test
+    # alone cannot explain clearly.
     visited_links: set[str] = set()
     stack = [roots[0]]
     while stack:
@@ -213,353 +195,150 @@ def _build_graph(robot: ET.Element) -> UrdfGraph:
     )
 
 
-def _iter_mesh_elements(
-    robot: ET.Element,
-) -> Iterator[tuple[str, str, int, ET.Element]]:
-    """Yield mesh elements with their owning link and geometry context."""
+def _resolve_mesh_path(filename: str, source_directory: Path, *, context: str) -> Path:
+    """Resolve one mesh filename using the source URDF directory.
+
+    ``package://PACKAGE/path`` is interpreted as ``path`` relative to the
+    source URDF directory. Ordinary relative paths use that same directory.
+
+    Args:
+        filename: Mesh filename from the URDF.
+        source_directory: Directory containing the source URDF.
+        context: Human-readable link and geometry role for errors.
+
+    Returns:
+        Absolute path to the existing mesh file.
+
+    Raises:
+        SplitError: If the filename is empty, malformed, or does not exist.
+    """
+
+    if not filename:
+        raise SplitError(f"{context} has a <mesh> without a filename.")
+
+    if filename.startswith("package://"):
+        package_relative = filename.removeprefix("package://")
+        package_name, separator, relative = package_relative.partition("/")
+        if (
+            not package_name
+            or not separator
+            or not relative
+            or Path(relative).is_absolute()
+        ):
+            raise SplitError(f"{context} has malformed mesh path {filename!r}.")
+        path = source_directory / relative
+    else:
+        path = Path(filename).expanduser()
+        if not path.is_absolute():
+            path = source_directory / path
+
+    resolved = path.resolve()
+    if not resolved.is_file():
+        raise SplitError(f"{context} mesh file does not exist: {resolved}")
+    return resolved
+
+
+def _validate_source_meshes(
+    robot: ET.Element, root_link: str, source_directory: Path
+) -> None:
+    """Validate the requested visual/collision mesh contract for every link.
+
+    The graph root alone may omit geometry when it contains neither a
+    ``<visual>`` nor ``<collision>`` element. Every other link, and a root that
+    declares either role, must contain at least one mesh-backed element for
+    both roles. Every declared mesh filename must resolve to an existing file.
+
+    Args:
+        robot: Source URDF ``<robot>`` element.
+        root_link: Name of the graph root link.
+        source_directory: Directory containing the source URDF.
+
+    Raises:
+        SplitError: If a required role is missing a mesh or a mesh path is
+            invalid.
+    """
 
     for link in robot.findall("link"):
         link_name = link.get("name", "<unnamed>")
-        for geometry_kind in ("visual", "collision"):
-            for index, geometry_owner in enumerate(
-                link.findall(geometry_kind), start=1
-            ):
-                for mesh in geometry_owner.findall("./geometry/mesh"):
-                    yield link_name, geometry_kind, index, mesh
+        visual_elements = link.findall("visual")
+        collision_elements = link.findall("collision")
+        if link_name == root_link and not visual_elements and not collision_elements:
+            continue
+
+        for role, elements in (
+            ("visual", visual_elements),
+            ("collision", collision_elements),
+        ):
+            meshes = [
+                mesh
+                for element in elements
+                for mesh in element.findall("./geometry/mesh")
+            ]
+            if not meshes:
+                raise SplitError(
+                    f"Link {link_name!r} requires a mesh-backed <{role}> element."
+                )
+            for mesh in meshes:
+                _resolve_mesh_path(
+                    mesh.get("filename", ""),
+                    source_directory,
+                    context=f"Link {link_name!r} <{role}>",
+                )
 
 
-def _parse_package_uri(filename: str) -> tuple[str, Path] | None:
-    """Parse a package URI into its package name and relative mesh path."""
-
-    if not filename.startswith("package://"):
-        return None
-    package_reference = filename.removeprefix("package://")
-    package_name, separator, package_relative = package_reference.partition("/")
-    if not separator or not package_name or not package_relative:
-        raise SplitError(f"malformed package URI {filename!r}")
-    relative_path = Path(package_relative)
-    if relative_path.is_absolute() or ".." in relative_path.parts:
-        raise SplitError(f"package URI escapes its package root: {filename!r}")
-    return package_name, relative_path
-
-
-def _resolve_package_roots(
-    robot: ET.Element,
-    source_path: Path,
-    configured_roots: Mapping[str, str | Path] | None,
-) -> dict[str, Path]:
-    """Bind every referenced package name to one unambiguous package root.
-
-    Explicit mappings take precedence. Otherwise, the source directory and its
-    parent are considered supported layouts. An inferred root is accepted only
-    when exactly one candidate contains every referenced path for that package.
+def _rewrite_mesh_paths(robot: ET.Element, source_directory: Path) -> None:
+    """Replace generated mesh filenames with resolved filesystem paths.
 
     Args:
-        robot: Parsed URDF root element.
-        source_path: Absolute source URDF path.
-        configured_roots: Optional package-name to package-root mapping.
-
-    Returns:
-        Resolved package roots keyed by package name.
+        robot: Generated URDF ``<robot>`` element to update.
+        source_directory: Directory containing the unmodified source URDF.
 
     Raises:
-        SplitError: If a mapping is invalid or an inferred binding is missing
-            or ambiguous.
+        SplitError: If a mesh filename cannot be resolved.
     """
 
-    explicit: dict[str, Path] = {}
-    for raw_name, raw_root in (configured_roots or {}).items():
-        package_name = raw_name.strip()
-        if not package_name or "/" in package_name:
-            raise SplitError(
-                f"Invalid package name in package-root mapping: {raw_name!r}."
-            )
-        package_root = Path(raw_root).expanduser().resolve()
-        if not package_root.is_dir():
-            raise SplitError(
-                f"Package root for {package_name!r} is not a directory: {package_root}"
-            )
-        explicit[package_name] = package_root
-
-    references: dict[str, set[Path]] = defaultdict(set)
-    malformed: list[str] = []
-    for link_name, geometry_kind, index, mesh in _iter_mesh_elements(robot):
-        filename = mesh.get("filename", "").strip()
-        if not filename.startswith("package://"):
-            continue
-        try:
-            parsed = _parse_package_uri(filename)
-        except SplitError as exc:
-            context = f"link {link_name!r} <{geometry_kind}>[{index}] <mesh>"
-            malformed.append(f"{context}: {exc}")
-            continue
-        if parsed is not None:
-            package_name, relative_path = parsed
-            references[package_name].add(relative_path)
-    if malformed:
-        formatted = "\n".join(f"  - {issue}" for issue in malformed)
-        raise SplitError(f"URDF package URI validation failed:\n{formatted}")
-
-    candidate_roots: list[Path] = []
-    for candidate in (source_path.parent, source_path.parent.parent):
-        resolved_candidate = candidate.resolve()
-        if resolved_candidate not in candidate_roots:
-            candidate_roots.append(resolved_candidate)
-
-    bindings: dict[str, Path] = {}
-    for package_name, relative_paths in sorted(references.items()):
-        if package_name in explicit:
-            bindings[package_name] = explicit[package_name]
-            continue
-        matches = [
-            candidate
-            for candidate in candidate_roots
-            if all(
-                (candidate / relative_path).is_file()
-                for relative_path in relative_paths
-            )
-        ]
-        option = f"--package-root {package_name}=PATH"
-        if not matches:
-            searched = ", ".join(str(candidate) for candidate in candidate_roots)
-            raise SplitError(
-                f"Could not infer a root for package {package_name!r}; no supported "
-                f"candidate contains all referenced meshes. Searched: {searched}. "
-                f"Pass {option}."
-            )
-        if len(matches) > 1:
-            choices = ", ".join(str(candidate) for candidate in matches)
-            raise SplitError(
-                f"Package {package_name!r} is ambiguous because every referenced "
-                f"mesh exists beneath multiple candidate roots: {choices}. Pass {option}."
-            )
-        bindings[package_name] = matches[0]
-    return bindings
-
-
-def _resolve_mesh_path(
-    filename: str,
-    source_path: Path,
-    package_roots: Mapping[str, Path],
-) -> Path:
-    """Resolve one mesh filename using source-relative and package bindings.
-
-    Args:
-        filename: Mesh filename exactly as stored in the URDF.
-        source_path: Absolute path of the source URDF.
-        package_roots: Validated package-name to root bindings.
-
-    Returns:
-        The absolute, normalized mesh path.
-
-    Raises:
-        SplitError: If the filename is empty, malformed, unsupported, or names
-            a package without a resolved binding.
-    """
-
-    filename = filename.strip()
-    if not filename:
-        raise SplitError("the filename attribute is missing or empty")
-
-    package_reference = _parse_package_uri(filename)
-    if package_reference is not None:
-        package_name, package_relative = package_reference
-        package_root = package_roots.get(package_name)
-        if package_root is None:
-            raise SplitError(
-                f"package {package_name!r} has no resolved root; pass "
-                f"--package-root {package_name}=PATH"
-            )
-        candidate = package_root / package_relative
-    else:
-        if "://" in filename:
-            raise SplitError(f"unsupported mesh URI {filename!r}")
-        candidate = Path(filename).expanduser()
-        if not candidate.is_absolute():
-            candidate = source_path.parent / candidate
-    return candidate.resolve()
-
-
-def _validate_meshes(
-    robot: ET.Element,
-    source_path: Path,
-    package_roots: Mapping[str, Path],
-) -> tuple[MeshReference, ...]:
-    """Validate all meshes and the global visual/collision mesh requirements."""
-
-    references: list[MeshReference] = []
-    issues: list[str] = []
-    mesh_counts = {"visual": 0, "collision": 0}
-
-    for link_name, geometry_kind, index, mesh in _iter_mesh_elements(robot):
-        mesh_counts[geometry_kind] += 1
-        filename = mesh.get("filename", "")
-        context = f"link {link_name!r} <{geometry_kind}>[{index}] <mesh>"
-        try:
-            resolved_path = _resolve_mesh_path(filename, source_path, package_roots)
-        except SplitError as exc:
-            issues.append(f"{context}: {exc}")
-            continue
-        if not resolved_path.is_file():
-            issues.append(
-                f"{context}: {filename!r} resolves to missing file {resolved_path}"
-            )
-            continue
-        references.append(
-            MeshReference(
-                link_name=link_name,
-                geometry_kind=geometry_kind,
-                geometry_index=index,
-                filename=filename,
-                resolved_path=resolved_path,
-            )
-        )
-
-    for geometry_kind in ("visual", "collision"):
-        if mesh_counts[geometry_kind] == 0:
-            issues.append(
-                f"the URDF has no mesh-backed <{geometry_kind}> geometry on any link"
-            )
-    if issues:
-        formatted = "\n".join(f"  - {issue}" for issue in issues)
-        raise SplitError(f"URDF mesh validation failed:\n{formatted}")
-    return tuple(references)
-
-
-def _load_urdf(path: Path) -> ET.ElementTree:
-    """Parse a URDF XML file while preserving comments."""
-
-    try:
-        parser = ET.XMLParser(target=ET.TreeBuilder(insert_comments=True))
-        tree = ET.parse(path, parser=parser)
-    except (OSError, ET.ParseError) as exc:
-        raise SplitError(f"Could not parse URDF {path}: {exc}") from exc
-    if tree.getroot().tag != "robot":
-        raise SplitError(f"Expected a <robot> root element in {path}.")
-    return tree
-
-
-def _validate_joint_kinematics(graph: UrdfGraph) -> None:
-    """Validate every joint origin, axis, and q=0 position limit.
-
-    Revolute and prismatic joints must contain finite lower and upper limits
-    that include zero because generated inactive arms are fixed at URDF q=0.
-    Continuous joints have no position-limit requirement.
-    """
-
-    for joint_name, joint in graph.joints.items():
-        _origin_transform(joint)
-        joint_type = joint.get("type")
-        if joint_type in _ACTIVE_JOINT_TYPES:
-            _joint_axis(joint)
-        if joint_type not in {"prismatic", "revolute"}:
-            continue
-
-        limit = joint.find("limit")
-        if limit is None:
-            raise SplitError(
-                f"Joint {joint_name!r} of type {joint_type!r} requires a "
-                "<limit lower=... upper=...> element."
-            )
-        lower_text = limit.get("lower")
-        upper_text = limit.get("upper")
-        if lower_text is None or upper_text is None:
-            raise SplitError(
-                f"Joint {joint_name!r} of type {joint_type!r} requires both "
-                "lower and upper position limits."
-            )
-        try:
-            lower = float(lower_text)
-            upper = float(upper_text)
-        except ValueError as exc:
-            raise SplitError(
-                f"Joint {joint_name!r} has non-numeric position limits: "
-                f"lower={lower_text!r}, upper={upper_text!r}."
-            ) from exc
-        if not math.isfinite(lower) or not math.isfinite(upper):
-            raise SplitError(
-                f"Joint {joint_name!r} must have finite position limits; "
-                f"found lower={lower_text!r}, upper={upper_text!r}."
-            )
-        if lower > upper:
-            raise SplitError(
-                f"Joint {joint_name!r} has reversed position limits "
-                f"[{lower}, {upper}]."
-            )
-        if not lower <= 0.0 <= upper:
-            raise SplitError(
-                f"Joint {joint_name!r} cannot use URDF q=0 as its inactive "
-                f"rest position because zero is outside its position limits "
-                f"[{lower}, {upper}]."
-            )
-
-
-def validate_urdf(
-    source_path: str | Path,
-    *,
-    package_roots: Mapping[str, str | Path] | None = None,
-) -> ValidationReport:
-    """Load and validate a source URDF without modifying it.
-
-    Args:
-        source_path: Source URDF path. Relative paths are resolved from the
-            current working directory.
-        package_roots: Optional explicit roots keyed by package name. Missing
-            package roots are inferred only when one supported candidate
-            satisfies every reference for that package.
-
-    Returns:
-        Parsed topology, resolved package bindings, and mesh references.
-
-    Raises:
-        SplitError: If the source is not a file or fails XML, topology, joint,
-            package-root, or mesh validation.
-    """
-
-    path = Path(source_path).expanduser().resolve()
-    if not path.is_file():
-        raise SplitError(f"The source URDF does not exist or is not a file: {path}")
-    tree = _load_urdf(path)
-    graph = _build_graph(tree.getroot())
-    _validate_joint_kinematics(graph)
-    resolved_package_roots = _resolve_package_roots(tree.getroot(), path, package_roots)
-    mesh_references = _validate_meshes(tree.getroot(), path, resolved_package_roots)
-    return ValidationReport(
-        source_path=path,
-        tree=tree,
-        graph=graph,
-        mesh_references=mesh_references,
-        package_roots=tuple(sorted(resolved_package_roots.items())),
-    )
+    for link in robot.findall("link"):
+        link_name = link.get("name", "<unnamed>")
+        for role in ("visual", "collision"):
+            for mesh in link.findall(f"./{role}/geometry/mesh"):
+                resolved = _resolve_mesh_path(
+                    mesh.get("filename", ""),
+                    source_directory,
+                    context=f"Link {link_name!r} <{role}>",
+                )
+                mesh.set("filename", str(resolved))
 
 
 def _find_descendant_joint_path(
     graph: UrdfGraph, start_joint: str, end_joint: str
 ) -> list[ET.Element] | None:
-    """Return the unique tree path from a start joint to its descendant."""
+    """Return the unique descendant path from start to end, if it exists."""
 
     start = graph.joints[start_joint]
 
-    def visit(joint: ET.Element) -> list[ET.Element] | None:
-        """Search the already validated tree below one joint."""
-
-        if joint.get("name") == end_joint:
+    def visit(joint: ET.Element, ancestors: set[str]) -> list[ET.Element] | None:
+        name = joint.get("name", "")
+        if name in ancestors:
+            raise SplitError(f"Cycle encountered while tracing joint {name!r}.")
+        if name == end_joint:
             return [joint]
+        next_ancestors = ancestors | {name}
         for child_joint in graph.outgoing.get(_joint_child(joint), ()):
-            suffix = visit(child_joint)
+            suffix = visit(child_joint, next_ancestors)
             if suffix is not None:
                 return [joint, *suffix]
         return None
 
-    return visit(start)
+    return visit(start, set())
 
 
 def _format_branch(last_joint: ET.Element, choices: list[ET.Element]) -> str:
-    """Format a branch point and its candidate outgoing joints."""
-
     child_link = _joint_child(last_joint)
     lines = [
-        f"Branch encountered after joint {last_joint.get('name')!r} at link {child_link!r}:"
+        (
+            f"Branch encountered after joint {last_joint.get('name')!r} "
+            f"at link {child_link!r}:"
+        ),
     ]
     for joint in choices:
         lines.append(
@@ -576,16 +355,8 @@ def _resolve_arm_selection(
     first_joint_name: str,
     end_joint_name: str | None,
 ) -> ArmSelection:
-    """Resolve one arm path without prompting or other CLI side effects."""
-
     if first_joint_name not in graph.joints:
         raise SplitError(f"Unknown {label} first actuator joint: {first_joint_name!r}.")
-    first_joint = graph.joints[first_joint_name]
-    if first_joint.get("type") not in _ACTIVE_JOINT_TYPES:
-        raise SplitError(
-            f"The {label} first actuator {first_joint_name!r} must be revolute, "
-            f"continuous, or prismatic; found {first_joint.get('type')!r}."
-        )
 
     if end_joint_name is not None:
         if end_joint_name not in graph.joints:
@@ -593,78 +364,67 @@ def _resolve_arm_selection(
         path = _find_descendant_joint_path(graph, first_joint_name, end_joint_name)
         if path is None:
             raise SplitError(
-                f"Joint {end_joint_name!r} is not a descendant of {first_joint_name!r}."
+                f"Joint {end_joint_name!r} is not a descendant of "
+                f"{first_joint_name!r}."
             )
     else:
         path = []
-        current = first_joint
+        current = graph.joints[first_joint_name]
         while True:
             path.append(current)
             choices = graph.outgoing.get(_joint_child(current), [])
             if not choices:
                 break
-            if len(choices) > 1:
+            if len(choices) == 1:
+                current = choices[0]
+                continue
+
+            branch_message = _format_branch(current, choices)
+            print(f"\n{label.capitalize()} arm: {branch_message}", file=sys.stderr)
+            if not sys.stdin.isatty():
                 option = f"--{label}-end-joint"
                 raise SplitError(
-                    f"Cannot infer the {label} arm endpoint. "
-                    f"{_format_branch(current, choices)}\nPass {option} with the "
-                    "last joint belonging to the arm."
+                    f"Cannot resolve the {label} arm non-interactively. "
+                    f"Pass {option} with the last joint belonging to the arm."
                 )
-            current = choices[0]
+            print(
+                "Enter the name of the last joint belonging to this arm. "
+                f"Enter {current.get('name')!r} if the arm ends before the branch.",
+                file=sys.stderr,
+            )
+            selected_end = input(f"{label} arm last joint: ").strip()
+            if not selected_end:
+                raise SplitError("A joint name is required to resolve the branch.")
+            if selected_end not in graph.joints:
+                raise SplitError(f"Unknown joint: {selected_end!r}.")
+            resolved = _find_descendant_joint_path(
+                graph, first_joint_name, selected_end
+            )
+            if resolved is None:
+                raise SplitError(
+                    f"Joint {selected_end!r} is not a descendant of "
+                    f"{first_joint_name!r}."
+                )
+            path = resolved
+            break
 
     path_names = tuple(joint.get("name", "") for joint in path)
-    active_joints = tuple(
-        joint.get("name", "")
-        for joint in path
-        if joint.get("type") in _ACTIVE_JOINT_TYPES
+    active = tuple(
+        joint.get("name", "") for joint in path if joint.get("type") == "revolute"
     )
-    if not active_joints:
-        raise SplitError(f"The selected {label} arm path has no movable joints.")
     return ArmSelection(
         label=label,
         first_joint=first_joint_name,
         path=path_names,
-        active_joints=active_joints,
+        active_joints=active,
     )
 
 
-def _subtree_joint_names(graph: UrdfGraph, first_joint_name: str) -> set[str]:
-    """Return every joint in the subtree rooted at a selected first joint."""
-
-    names: set[str] = set()
-    stack = [graph.joints[first_joint_name]]
-    while stack:
-        joint = stack.pop()
-        name = joint.get("name", "")
-        names.add(name)
-        stack.extend(graph.outgoing.get(_joint_child(joint), ()))
-    return names
-
-
-def _validate_arm_pair(
-    graph: UrdfGraph, left: ArmSelection, right: ArmSelection
-) -> None:
-    """Require the two selected arms to occupy independent topology branches."""
-
-    left_subtree = _subtree_joint_names(graph, left.first_joint)
-    right_subtree = _subtree_joint_names(graph, right.first_joint)
-    overlap = sorted(left_subtree & right_subtree)
-    if overlap:
-        raise SplitError(
-            "Left and right first actuators must root independent subtrees; "
-            f"overlapping joints: {overlap}."
-        )
-
-
 def _identity() -> Matrix4:
-    """Return a four-dimensional identity transform."""
-
     return [[1.0 if row == col else 0.0 for col in range(4)] for row in range(4)]
 
 
 def _multiply(a: Matrix4, b: Matrix4) -> Matrix4:
-    """Multiply two homogeneous transforms."""
-
     return [
         [sum(a[row][k] * b[k][col] for k in range(4)) for col in range(4)]
         for row in range(4)
@@ -672,31 +432,23 @@ def _multiply(a: Matrix4, b: Matrix4) -> Matrix4:
 
 
 def _origin_transform(joint: ET.Element) -> Matrix4:
-    """Convert a joint's URDF origin into a homogeneous transform."""
-
     origin = joint.find("origin")
     xyz_text = origin.get("xyz", "0 0 0") if origin is not None else "0 0 0"
     rpy_text = origin.get("rpy", "0 0 0") if origin is not None else "0 0 0"
     try:
         xyz = [float(value) for value in xyz_text.split()]
-        rpy = [float(value) for value in rpy_text.split()]
+        roll, pitch, yaw = [float(value) for value in rpy_text.split()]
     except ValueError as exc:
         raise SplitError(
             f"Joint {joint.get('name')!r} has a non-numeric origin."
         ) from exc
-    if (
-        len(xyz) != 3
-        or len(rpy) != 3
-        or not all(math.isfinite(value) for value in [*xyz, *rpy])
-    ):
-        raise SplitError(
-            f"Joint {joint.get('name')!r} must have finite three-value xyz/rpy."
-        )
+    if len(xyz) != 3 or len(rpy_text.split()) != 3:
+        raise SplitError(f"Joint {joint.get('name')!r} must have three-value xyz/rpy.")
 
-    roll, pitch, yaw = rpy
     cr, sr = math.cos(roll), math.sin(roll)
     cp, sp = math.cos(pitch), math.sin(pitch)
     cy, sy = math.cos(yaw), math.sin(yaw)
+    # URDF fixed-axis RPY: Rz(yaw) @ Ry(pitch) @ Rx(roll).
     rotation = [
         [cy * cp, cy * sp * sr - sy * cr, cy * sp * cr + sy * sr],
         [sy * cp, sy * sp * sr + cy * cr, sy * sp * cr - cy * sr],
@@ -709,8 +461,6 @@ def _origin_transform(joint: ET.Element) -> Matrix4:
 
 
 def _inverse_rigid(transform: Matrix4) -> Matrix4:
-    """Invert a homogeneous rigid transform."""
-
     rotation_t = [[transform[col][row] for col in range(3)] for row in range(3)]
     translation = [transform[row][3] for row in range(3)]
     inverse_translation = [
@@ -722,12 +472,12 @@ def _inverse_rigid(transform: Matrix4) -> Matrix4:
 
 
 def _joint_axis(joint: ET.Element) -> list[float]:
-    """Return a normalized local axis for a one-degree-of-freedom joint."""
+    """Return a selected revolute joint's normalized local axis."""
 
-    if joint.get("type") not in _ACTIVE_JOINT_TYPES:
+    if joint.get("type") != "revolute":
         raise SplitError(
-            f"Joint {joint.get('name')!r} must be revolute, continuous, or "
-            f"prismatic; found {joint.get('type')!r}."
+            f"Joint {joint.get('name')!r} must be revolute; "
+            f"found type {joint.get('type')!r}."
         )
     axis = joint.find("axis")
     axis_text = axis.get("xyz", "1 0 0") if axis is not None else "1 0 0"
@@ -748,8 +498,6 @@ def _joint_axis(joint: ET.Element) -> list[float]:
 
 
 def _cross(a: list[float], b: list[float]) -> list[float]:
-    """Return the three-dimensional cross product of two vectors."""
-
     return [
         a[1] * b[2] - a[2] * b[1],
         a[2] * b[0] - a[0] * b[2],
@@ -758,7 +506,7 @@ def _cross(a: list[float], b: list[float]) -> list[float]:
 
 
 def _rotation_aligning_axis_with_world_z(axis: list[float]) -> Matrix4:
-    """Map the positive first-actuator axis to world negative Z."""
+    """Map the positive actuator axis to -Z so the Axol arm extends toward +Z."""
 
     target = [0.0, 0.0, -1.0]
     cross = _cross(axis, target)
@@ -768,6 +516,8 @@ def _rotation_aligning_axis_with_world_z(axis: list[float]) -> Matrix4:
     if sine <= 1e-12:
         if cosine > 0.0:
             return _identity()
+        # The vectors are antiparallel. Pick a deterministic axis orthogonal
+        # to the source and rotate by pi: R = 2*u*u^T - I.
         reference = [1.0, 0.0, 0.0] if abs(axis[0]) < 0.9 else [0.0, 1.0, 0.0]
         rotation_axis = _cross(axis, reference)
         axis_norm = math.sqrt(sum(value * value for value in rotation_axis))
@@ -781,6 +531,7 @@ def _rotation_aligning_axis_with_world_z(axis: list[float]) -> Matrix4:
             for row in range(3)
         ]
     else:
+        # Rodrigues' formula with an unnormalized cross-product matrix.
         x, y, z = cross
         skew = [[0.0, -z, y], [z, 0.0, -x], [-y, x, 0.0]]
         skew_squared = [
@@ -797,12 +548,95 @@ def _rotation_aligning_axis_with_world_z(axis: list[float]) -> Matrix4:
             ]
             for row in range(3)
         ]
+
     return [[*rotation[row], 0.0] for row in range(3)] + [[0.0, 0.0, 0.0, 1.0]]
 
 
-def _matrix_to_xyz_rpy(transform: Matrix4) -> tuple[list[float], list[float]]:
-    """Convert a homogeneous transform to URDF XYZ and fixed-axis RPY."""
+def _rotation_about_axis(axis: list[float], angle_rad: float) -> Matrix4:
+    """Return a homogeneous rotation about a normalized axis.
 
+    Args:
+        axis: Normalized local rotation axis.
+        angle_rad: Joint angle in radians.
+
+    Returns:
+        Homogeneous rotation transform.
+    """
+
+    x, y, z = axis
+    cosine = math.cos(angle_rad)
+    sine = math.sin(angle_rad)
+    one_minus_cosine = 1.0 - cosine
+    rotation = [
+        [
+            cosine + x * x * one_minus_cosine,
+            x * y * one_minus_cosine - z * sine,
+            x * z * one_minus_cosine + y * sine,
+        ],
+        [
+            y * x * one_minus_cosine + z * sine,
+            cosine + y * y * one_minus_cosine,
+            y * z * one_minus_cosine - x * sine,
+        ],
+        [
+            z * x * one_minus_cosine - y * sine,
+            z * y * one_minus_cosine + x * sine,
+            cosine + z * z * one_minus_cosine,
+        ],
+    ]
+    return [[*rotation[row], 0.0] for row in range(3)] + [[0.0, 0.0, 0.0, 1.0]]
+
+
+def _link_transform(
+    graph: UrdfGraph,
+    link_name: str,
+    joint_positions_rad: dict[str, float],
+) -> Matrix4:
+    """Compute root-to-link FK from URDF joint origins and positions.
+
+    Args:
+        graph: Generated URDF topology.
+        link_name: Link whose transform is requested.
+        joint_positions_rad: Movable revolute-joint positions in radians.
+
+    Returns:
+        Homogeneous root-to-link transform.
+
+    Raises:
+        SplitError: If the link is missing or a movable joint has no position.
+    """
+
+    if link_name not in graph.links:
+        raise SplitError(f"Unknown FK link {link_name!r}.")
+
+    path: list[ET.Element] = []
+    current_link = link_name
+    while current_link != graph.root_link:
+        joint = graph.incoming.get(current_link)
+        if joint is None:
+            raise SplitError(
+                f"Link {link_name!r} is disconnected from root {graph.root_link!r}."
+            )
+        path.append(joint)
+        current_link = _joint_parent(joint)
+
+    transform = _identity()
+    for joint in reversed(path):
+        transform = _multiply(transform, _origin_transform(joint))
+        if joint.get("type") == "revolute":
+            joint_name = joint.get("name", "")
+            if joint_name not in joint_positions_rad:
+                raise SplitError(f"Missing FK position for joint {joint_name!r}.")
+            transform = _multiply(
+                transform,
+                _rotation_about_axis(
+                    _joint_axis(joint), joint_positions_rad[joint_name]
+                ),
+            )
+    return transform
+
+
+def _matrix_to_xyz_rpy(transform: Matrix4) -> tuple[list[float], list[float]]:
     xyz = [transform[row][3] for row in range(3)]
     r20 = max(-1.0, min(1.0, transform[2][0]))
     pitch = math.asin(-r20)
@@ -810,14 +644,13 @@ def _matrix_to_xyz_rpy(transform: Matrix4) -> tuple[list[float], list[float]]:
         roll = math.atan2(transform[2][1], transform[2][2])
         yaw = math.atan2(transform[1][0], transform[0][0])
     else:
+        # At gimbal lock, select the equivalent representation with roll=0.
         roll = 0.0
         yaw = math.atan2(-transform[0][1], transform[1][1])
     return xyz, [roll, pitch, yaw]
 
 
 def _root_to_joint_frame(graph: UrdfGraph, joint_name: str) -> Matrix4:
-    """Calculate source-root to joint-frame FK at the URDF zero configuration."""
-
     selected = graph.joints[joint_name]
     parent_link = _joint_parent(selected)
     ancestors: list[ET.Element] = []
@@ -839,8 +672,6 @@ def _root_to_joint_frame(graph: UrdfGraph, joint_name: str) -> Matrix4:
 
 
 def _unique_name(preferred: str, existing: set[str]) -> str:
-    """Return a deterministic name not already present in a URDF."""
-
     if preferred not in existing:
         return preferred
     index = 2
@@ -849,18 +680,7 @@ def _unique_name(preferred: str, existing: set[str]) -> str:
     return f"{preferred}_{index}"
 
 
-def _freeze_joint_at_zero(joint: ET.Element) -> None:
-    """Convert a supported movable joint to fixed at its URDF q=0 pose."""
-
-    if joint.get("type") not in _ACTIVE_JOINT_TYPES:
-        raise SplitError(
-            f"Cannot freeze unsupported joint {joint.get('name')!r} of type "
-            f"{joint.get('type')!r}."
-        )
-    # At q=0, revolute/continuous rotation and prismatic translation are both
-    # identity transforms, so retaining the exact origin preserves the pose.
-    _origin_transform(joint)
-    _joint_axis(joint)
+def _freeze_joint(joint: ET.Element) -> None:
     joint.set("type", "fixed")
     for child in list(joint):
         if child.tag in _FIXED_JOINT_FIELDS:
@@ -870,7 +690,7 @@ def _freeze_joint_at_zero(joint: ET.Element) -> None:
 def _remove_inactive_transmissions(
     robot: ET.Element, frozen_joint_names: set[str]
 ) -> list[str]:
-    """Remove standard transmissions that reference newly fixed joints."""
+    """Remove standard transmissions that refer to newly fixed joints."""
 
     removed: list[str] = []
     for transmission in list(robot.findall("transmission")):
@@ -882,21 +702,17 @@ def _remove_inactive_transmissions(
 
 
 def _format_number(value: float) -> str:
-    """Format a stable finite floating-point value for URDF XML."""
-
     if abs(value) < 1e-14:
         value = 0.0
     return f"{value:.17g}"
 
 
 def _format_vector(values: list[float]) -> str:
-    """Format a numeric vector for a URDF attribute."""
-
     return " ".join(_format_number(value) for value in values)
 
 
 def _element_signature(element: ET.Element) -> tuple[object, ...]:
-    """Return a whitespace-insensitive structural XML signature."""
+    """Return a whitespace-insensitive structural signature."""
 
     text = (element.text or "").strip()
     return (
@@ -907,135 +723,47 @@ def _element_signature(element: ET.Element) -> tuple[object, ...]:
     )
 
 
-def _matrix_error(a: Matrix4, b: Matrix4) -> float:
-    """Return the maximum absolute entry difference between transforms."""
-
-    return max(abs(a[row][col] - b[row][col]) for row in range(4) for col in range(4))
-
-
-def _validate_generated_tree(
-    *,
-    source_tree: ET.ElementTree,
-    generated_tree: ET.ElementTree,
-    selection: ArmSelection,
-    expected_root: str,
-    source_root_to_actuator: Matrix4,
-    new_root_joint: ET.Element,
-    frozen_joint_names: set[str],
-) -> None:
-    """Validate topology, q=0 freezing, geometry, and generated root invariants."""
-
-    source_graph = _build_graph(source_tree.getroot())
-    generated_graph = _build_graph(generated_tree.getroot())
-
-    if generated_graph.root_link != expected_root:
-        raise SplitError(
-            f"Generated root is {generated_graph.root_link!r}, expected {expected_root!r}."
-        )
-    movable = {
-        name
-        for name, joint in generated_graph.joints.items()
-        if joint.get("type") in _ACTIVE_JOINT_TYPES
-    }
-    if movable != set(selection.active_joints):
-        raise SplitError(
-            f"Generated movable joints {sorted(movable)} do not equal selected "
-            f"joints {sorted(selection.active_joints)}."
-        )
-
-    for name, source_link in source_graph.links.items():
-        generated_link = generated_graph.links.get(name)
-        if generated_link is None:
-            raise SplitError(f"Generated URDF is missing original link {name!r}.")
-        if _element_signature(generated_link) != _element_signature(source_link):
-            raise SplitError(f"Generated URDF modified original link {name!r}.")
-
-    for joint_name in selection.active_joints:
-        if generated_graph.joints[joint_name].get("type") != source_graph.joints[
-            joint_name
-        ].get("type"):
-            raise SplitError(f"Generated URDF changed active joint {joint_name!r}.")
-
-    for joint_name in frozen_joint_names:
-        source_joint = source_graph.joints[joint_name]
-        generated_joint = generated_graph.joints[joint_name]
-        if generated_joint.get("type") != "fixed":
-            raise SplitError(f"Generated URDF did not freeze joint {joint_name!r}.")
-        origin_error = _matrix_error(
-            _origin_transform(source_joint), _origin_transform(generated_joint)
-        )
-        if origin_error > 1e-12:
-            raise SplitError(
-                f"Freezing joint {joint_name!r} changed its q=0 origin "
-                f"(transform error {origin_error:.3g})."
-            )
-        retained_fields = [
-            child.tag for child in generated_joint if child.tag in _FIXED_JOINT_FIELDS
-        ]
-        if retained_fields:
-            raise SplitError(
-                f"Fixed joint {joint_name!r} retains movable-only fields: "
-                f"{retained_fields}."
-            )
-
-    split_root_to_actuator = _multiply(
-        _origin_transform(new_root_joint), source_root_to_actuator
-    )
-    position_error = max(abs(split_root_to_actuator[row][3]) for row in range(3))
-    actuator_axis = _joint_axis(source_graph.joints[selection.first_joint])
-    axis_in_split_root = [
-        sum(split_root_to_actuator[row][col] * actuator_axis[col] for col in range(3))
-        for row in range(3)
-    ]
-    axis_error = max(
-        abs(actual - expected)
-        for actual, expected in zip(axis_in_split_root, (0.0, 0.0, -1.0))
-    )
-    if position_error > 1e-9 or axis_error > 1e-9:
-        raise SplitError(
-            "Generated base does not place the first actuator at its origin "
-            "with its positive axis along world -Z; "
-            f"position error is {position_error:.3g}, axis error is {axis_error:.3g}."
-        )
-
-
-def _rewrite_generated_mesh_paths(
-    tree: ET.ElementTree,
-    source_path: Path,
-    package_roots: Mapping[str, Path],
-) -> None:
-    """Rewrite generated mesh filenames to validated absolute filesystem paths."""
-
-    for _, _, _, mesh in _iter_mesh_elements(tree.getroot()):
-        filename = mesh.get("filename", "")
-        mesh.set(
-            "filename",
-            str(_resolve_mesh_path(filename, source_path, package_roots)),
-        )
-    _validate_meshes(tree.getroot(), source_path, package_roots)
-
-
 def _generate_arm_tree(
-    source: ValidationReport, selection: ArmSelection
-) -> GeneratedArm:
-    """Generate and validate one selected-arm URDF tree at inactive q=0."""
+    source_tree: ET.ElementTree,
+    source_graph: UrdfGraph,
+    selection: ArmSelection,
+    source_directory: Path,
+) -> tuple[ET.ElementTree, list[str], list[str]]:
+    """Generate one split-arm tree while preserving the existing split rules.
 
-    generated_tree = copy.deepcopy(source.tree)
+    Args:
+        source_tree: Parsed source URDF tree.
+        source_graph: Validated topology of the source URDF.
+        selection: Arm path whose revolute joints remain movable.
+        source_directory: Directory used to resolve source mesh filenames.
+
+    Returns:
+        Generated tree, names of frozen joints, and removed transmissions.
+
+    Raises:
+        SplitError: If generation violates a splitter invariant or a generated
+            mesh path cannot be resolved.
+    """
+
+    generated_tree = copy.deepcopy(source_tree)
     robot = generated_tree.getroot()
     generated_graph = _build_graph(robot)
     active = set(selection.active_joints)
     frozen: list[str] = []
+
     for name, joint in generated_graph.joints.items():
-        if name not in active and joint.get("type") in _ACTIVE_JOINT_TYPES:
-            _freeze_joint_at_zero(joint)
+        if name not in active and joint.get("type") in _MOVABLE_JOINT_TYPES:
             frozen.append(name)
+            _freeze_joint(joint)
 
     removed_transmissions = _remove_inactive_transmissions(robot, set(frozen))
-    root_to_actuator = _root_to_joint_frame(source.graph, selection.first_joint)
-    actuator_axis = _joint_axis(source.graph.joints[selection.first_joint])
+
+    root_to_actuator = _root_to_joint_frame(source_graph, selection.first_joint)
+    actuator_axis = _joint_axis(source_graph.joints[selection.first_joint])
     actuator_in_split_root = _rotation_aligning_axis_with_world_z(actuator_axis)
     split_root_to_source_root = _multiply(
-        actuator_in_split_root, _inverse_rigid(root_to_actuator)
+        actuator_in_split_root,
+        _inverse_rigid(root_to_actuator),
     )
     xyz, rpy = _matrix_to_xyz_rpy(split_root_to_source_root)
 
@@ -1061,163 +789,421 @@ def _generate_arm_tree(
         {"xyz": _format_vector(xyz), "rpy": _format_vector(rpy)},
     )
     ET.SubElement(root_joint, "parent", {"link": base_link_name})
-    ET.SubElement(root_joint, "child", {"link": source.graph.root_link})
+    ET.SubElement(root_joint, "child", {"link": source_graph.root_link})
     robot.append(root_joint)
 
     _validate_generated_tree(
-        source_tree=source.tree,
+        source_tree=source_tree,
         generated_tree=generated_tree,
         selection=selection,
         expected_root=base_link_name,
         source_root_to_actuator=root_to_actuator,
         new_root_joint=root_joint,
-        frozen_joint_names=set(frozen),
     )
-    _rewrite_generated_mesh_paths(
-        generated_tree, source.source_path, dict(source.package_roots)
-    )
-    return GeneratedArm(
-        selection=selection,
-        tree=generated_tree,
-        frozen_joints=tuple(frozen),
-        removed_transmissions=tuple(removed_transmissions),
-    )
+    _rewrite_mesh_paths(robot, source_directory)
+    return generated_tree, frozen, removed_transmissions
 
 
-def split_urdf(
-    source_path: str | Path,
+def _validate_generated_tree(
     *,
-    left_first_joint: str,
-    right_first_joint: str,
-    left_end_joint: str | None = None,
-    right_end_joint: str | None = None,
-    package_roots: Mapping[str, str | Path] | None = None,
-) -> SplitResult:
-    """Validate and generate left/right URDF trees without writing files.
+    source_tree: ET.ElementTree,
+    generated_tree: ET.ElementTree,
+    selection: ArmSelection,
+    expected_root: str,
+    source_root_to_actuator: Matrix4,
+    new_root_joint: ET.Element,
+) -> None:
+    source_robot = source_tree.getroot()
+    generated_robot = generated_tree.getroot()
+    source_graph = _build_graph(source_robot)
+    generated_graph = _build_graph(generated_robot)
 
-    Inactive revolute, continuous, and prismatic joints are frozen at URDF
-    q=0, which preserves their existing origins. Active joints of those same
-    types remain movable when they occur on a selected path.
+    if generated_graph.root_link != expected_root:
+        raise SplitError(
+            f"Generated root is {generated_graph.root_link!r}, expected {expected_root!r}."
+        )
 
-    Args:
-        source_path: Source bimanual URDF path.
-        left_first_joint: First actuator joint of the left arm.
-        right_first_joint: First actuator joint of the right arm.
-        left_end_joint: Optional last joint on the left path when it branches.
-        right_end_joint: Optional last joint on the right path when it branches.
-        package_roots: Optional explicit roots keyed by package name.
+    movable = {
+        name
+        for name, joint in generated_graph.joints.items()
+        if joint.get("type") != "fixed"
+    }
+    if movable != set(selection.active_joints):
+        raise SplitError(
+            f"Generated movable joints {sorted(movable)} do not equal selected "
+            f"joints {sorted(selection.active_joints)}."
+        )
 
-    Returns:
-        Validated generated trees. Mesh paths are absolute in these trees; the
-        source file and parsed source tree remain unchanged.
+    # No original link is modified or removed.  This specifically protects all
+    # visual/collision geometry, inertials, materials, and mesh paths.
+    for name, source_link in source_graph.links.items():
+        generated_link = generated_graph.links.get(name)
+        if generated_link is None:
+            raise SplitError(f"Generated URDF is missing original link {name!r}.")
+        if _element_signature(generated_link) != _element_signature(source_link):
+            raise SplitError(f"Generated URDF modified original link {name!r}.")
 
-    Raises:
-        SplitError: If validation fails or the selections are ambiguous or do
-            not root independent arm subtrees.
-    """
-
-    if left_first_joint == right_first_joint:
-        raise SplitError("Left and right first actuator joints must be different.")
-    source = validate_urdf(source_path, package_roots=package_roots)
-    left_selection = _resolve_arm_selection(
-        source.graph,
-        label="left",
-        first_joint_name=left_first_joint,
-        end_joint_name=left_end_joint,
+    # The new base origin must coincide with the first actuator origin at q=0,
+    # and its actuator axis must be parallel to world Z.  Axol extends opposite
+    # the positive actuator direction, so positive points -Z and the arm +Z.
+    split_root_to_actuator = _multiply(
+        _origin_transform(new_root_joint),
+        source_root_to_actuator,
     )
-    right_selection = _resolve_arm_selection(
-        source.graph,
-        label="right",
-        first_joint_name=right_first_joint,
-        end_joint_name=right_end_joint,
+    origin_error = max(abs(split_root_to_actuator[row][3]) for row in range(3))
+    actuator_axis = _joint_axis(source_graph.joints[selection.first_joint])
+    axis_in_split_root = [
+        sum(split_root_to_actuator[row][col] * actuator_axis[col] for col in range(3))
+        for row in range(3)
+    ]
+    axis_error = max(
+        abs(actual - expected)
+        for actual, expected in zip(axis_in_split_root, (0.0, 0.0, -1.0))
     )
-    _validate_arm_pair(source.graph, left_selection, right_selection)
-    return SplitResult(
-        source=source,
-        left=_generate_arm_tree(source, left_selection),
-        right=_generate_arm_tree(source, right_selection),
-    )
+    if origin_error > 1e-9 or axis_error > 1e-9:
+        raise SplitError(
+            "Generated base does not place the first actuator at its origin "
+            "with its positive axis along world -Z; "
+            f"origin error is {origin_error:.3g}, axis error is {axis_error:.3g}."
+        )
 
 
-def default_output_path(source_path: str | Path, label: str) -> Path:
-    """Return the conventional ``SOURCE-STEM-LABEL.urdf`` output path."""
-
-    source = Path(source_path).expanduser().resolve()
-    return source.with_name(f"{source.stem}-{label}{source.suffix}")
+def _load_urdf(path: Path) -> ET.ElementTree:
+    try:
+        parser = ET.XMLParser(target=ET.TreeBuilder(insert_comments=True))
+        tree = ET.parse(path, parser=parser)
+    except (OSError, ET.ParseError) as exc:
+        raise SplitError(f"Could not parse URDF {path}: {exc}") from exc
+    if tree.getroot().tag != "robot":
+        raise SplitError(f"Expected a <robot> root element in {path}.")
+    return tree
 
 
 def _write_tree(tree: ET.ElementTree, destination: Path, *, force: bool) -> None:
-    """Write one generated tree, refusing an overwrite unless requested."""
-
     if destination.exists() and not force:
         raise SplitError(
             f"Refusing to overwrite {destination}; pass --force to replace it."
         )
     destination.parent.mkdir(parents=True, exist_ok=True)
-    output_tree = copy.deepcopy(tree)
-    ET.indent(output_tree, space="    ")
-    output_tree.write(
-        destination,
-        encoding="utf-8",
-        xml_declaration=False,
-        short_empty_elements=True,
+    ET.indent(tree, space="    ")
+    tree.write(
+        destination, encoding="utf-8", xml_declaration=False, short_empty_elements=True
     )
 
 
-def write_split_urdfs(
-    result: SplitResult,
-    *,
-    left_output: str | Path | None = None,
-    right_output: str | Path | None = None,
-    force: bool = False,
-) -> tuple[Path, Path]:
-    """Write generated left/right trees using explicit or default paths.
+def _equivalent_angle_within_limits(
+    angle_rad: float, lower_rad: float, upper_rad: float
+) -> float | None:
+    """Return the equivalent bounded angle closest to zero.
 
     Args:
-        result: Generated split returned by :func:`split_urdf`.
-        left_output: Optional left destination. Defaults beside the source.
-        right_output: Optional right destination. Defaults beside the source.
-        force: Whether existing output files may be replaced.
+        angle_rad: Desired revolute-joint angle in radians.
+        lower_rad: Inclusive lower joint limit in radians.
+        upper_rad: Inclusive upper joint limit in radians.
 
     Returns:
-        Absolute left and right output paths.
-
-    Raises:
-        SplitError: If outputs collide with each other or the source, or an
-            existing destination is not allowed to be overwritten.
+        Equivalent angle within the limits, or ``None`` when unreachable.
     """
 
-    source_path = result.source.source_path
-    left_path = (
-        Path(left_output).expanduser().resolve()
-        if left_output is not None
-        else default_output_path(source_path, "left")
+    minimum_turn = math.ceil(
+        (lower_rad - angle_rad - _JOINT_LIMIT_TOLERANCE_RAD) / math.tau
     )
-    right_path = (
-        Path(right_output).expanduser().resolve()
-        if right_output is not None
-        else default_output_path(source_path, "right")
+    maximum_turn = math.floor(
+        (upper_rad - angle_rad + _JOINT_LIMIT_TOLERANCE_RAD) / math.tau
     )
-    if left_path == right_path:
-        raise SplitError("Left and right output paths must be different.")
-    if source_path in {left_path, right_path}:
-        raise SplitError("An output path must not overwrite the source URDF.")
+    if minimum_turn > maximum_turn:
+        return None
 
-    _write_tree(result.left.tree, left_path, force=force)
-    try:
-        _write_tree(result.right.tree, right_path, force=force)
-    except Exception:
-        print(
-            f"Left output was written before the right output failed: {left_path}",
-            file=sys.stderr,
+    nearest_turn = round(-angle_rad / math.tau)
+    turn = min(max(nearest_turn, minimum_turn), maximum_turn)
+    bounded_angle = angle_rad + turn * math.tau
+    bounded_angle = min(max(bounded_angle, lower_rad), upper_rad)
+    return 0.0 if abs(bounded_angle) <= _JOINT_LIMIT_TOLERANCE_RAD else bounded_angle
+
+
+def _canonical_xyzw_quaternion(transform: Matrix4) -> list[float]:
+    """Convert a homogeneous transform to a deterministic XYZW quaternion.
+
+    Args:
+        transform: Homogeneous TCP transform.
+
+    Returns:
+        Unit quaternion ordered as X, Y, Z, W with a canonical sign.
+    """
+
+    trace = sum(transform[index][index] for index in range(3))
+    if trace > 0.0:
+        scale = math.sqrt(trace + 1.0) * 2.0
+        quaternion = [
+            (transform[2][1] - transform[1][2]) / scale,
+            (transform[0][2] - transform[2][0]) / scale,
+            (transform[1][0] - transform[0][1]) / scale,
+            0.25 * scale,
+        ]
+    else:
+        diagonal_index = max(range(3), key=lambda index: transform[index][index])
+        next_index = (diagonal_index + 1) % 3
+        final_index = (diagonal_index + 2) % 3
+        scale = (
+            math.sqrt(
+                1.0
+                + transform[diagonal_index][diagonal_index]
+                - transform[next_index][next_index]
+                - transform[final_index][final_index]
+            )
+            * 2.0
         )
-        raise
-    return left_path, right_path
+        quaternion = [0.0, 0.0, 0.0, 0.0]
+        quaternion[diagonal_index] = 0.25 * scale
+        quaternion[3] = (
+            transform[final_index][next_index] - transform[next_index][final_index]
+        ) / scale
+        quaternion[next_index] = (
+            transform[next_index][diagonal_index]
+            + transform[diagonal_index][next_index]
+        ) / scale
+        quaternion[final_index] = (
+            transform[final_index][diagonal_index]
+            + transform[diagonal_index][final_index]
+        ) / scale
+
+    norm = math.sqrt(sum(value * value for value in quaternion))
+    quaternion = [value / norm for value in quaternion]
+    first_vector_component = next(
+        (float(value) for value in quaternion[:3] if value != 0.0), 1.0
+    )
+    if quaternion[3] < 0.0 or (quaternion[3] == 0.0 and first_vector_component < 0.0):
+        quaternion = [-value for value in quaternion]
+    return quaternion
+
+
+def _compute_full_stretch(
+    urdf_path: Path,
+    selection: ArmSelection,
+    source_graph: UrdfGraph,
+) -> ManifestEntry:
+    """Compute one arm's farthest reachable cardinal-axis rest pose.
+
+    The generated root places the first actuator at the origin with its
+    positive axis along world ``-Z``. Keeping every downstream joint at its
+    URDF rest value of zero therefore leaves only four possible first-joint
+    rotations: align the rest TCP projection with ``+X``, ``-X``, ``+Y``, or
+    ``-Y``. FK evaluates the reachable candidates, and the greatest signed
+    distance wins with that same fixed tie order.
+
+    Args:
+        urdf_path: Generated split-arm URDF.
+        selection: Arm selection used to generate the URDF.
+        source_graph: Source graph used to identify the terminal TCP link.
+
+    Returns:
+        Minimal manifest entry containing model and full-stretch pose data.
+
+    Raises:
+        SplitError: If joint bounds are invalid or no cardinal pose is reachable.
+    """
+
+    generated_tree = _load_urdf(urdf_path)
+    generated_graph = _build_graph(generated_tree.getroot())
+    active_joint_order = list(selection.active_joints)
+    if not active_joint_order:
+        raise SplitError(f"Arm {selection.label!r} has no active revolute joints.")
+
+    bounds: list[tuple[float, float]] = []
+    for joint_name in active_joint_order:
+        joint = generated_graph.joints.get(joint_name)
+        limit = joint.find("limit") if joint is not None else None
+        if joint is None or joint.get("type") != "revolute" or limit is None:
+            raise SplitError(
+                f"Generated {selection.label} model has no bounded revolute joint "
+                f"{joint_name!r}."
+            )
+        try:
+            lower = float(limit.get("lower", ""))
+            upper = float(limit.get("upper", ""))
+        except ValueError as exc:
+            raise SplitError(
+                f"Joint {joint_name!r} must have numeric lower and upper limits."
+            ) from exc
+        if not math.isfinite(lower) or not math.isfinite(upper):
+            raise SplitError(f"Joint {joint_name!r} must have finite limits.")
+        if lower > upper:
+            raise SplitError(f"Joint {joint_name!r} has reversed limits.")
+        bounds.append((lower, upper))
+
+    tcp_link = _joint_child(source_graph.joints[selection.path[-1]])
+    try:
+        first_joint_index = active_joint_order.index(selection.first_joint)
+    except ValueError as exc:
+        raise SplitError(
+            f"Generated {selection.label} model does not contain first joint "
+            f"{selection.first_joint!r}."
+        ) from exc
+
+    rest_joint_values = [0.0] * len(active_joint_order)
+    if any(
+        rest_value < lower - _JOINT_LIMIT_TOLERANCE_RAD
+        or rest_value > upper + _JOINT_LIMIT_TOLERANCE_RAD
+        for rest_value, (lower, upper) in zip(rest_joint_values, bounds)
+    ):
+        raise SplitError(
+            f"Arm {selection.label!r} cannot use the URDF zero configuration "
+            "as its full-stretch rest pose because it violates a joint limit."
+        )
+
+    rest_transform = _link_transform(
+        generated_graph,
+        tcp_link,
+        dict(zip(active_joint_order, rest_joint_values)),
+    )
+    rest_x = rest_transform[0][3]
+    rest_y = rest_transform[1][3]
+    if math.hypot(rest_x, rest_y) <= _CARDINAL_ALIGNMENT_TOLERANCE_M:
+        raise SplitError(
+            f"Arm {selection.label!r} has no horizontal TCP extension in its "
+            "URDF zero configuration."
+        )
+
+    rest_angle_rad = math.atan2(rest_y, rest_x)
+    first_lower, first_upper = bounds[first_joint_index]
+    best_distance = -math.inf
+    best_joint_values: list[float] | None = None
+    for axis_index, direction_sign, target_angle_rad in _CARDINAL_DIRECTIONS:
+        # Positive first-joint rotation is about world -Z, so it subtracts
+        # from the TCP projection angle.
+        first_joint_angle = _equivalent_angle_within_limits(
+            rest_angle_rad - target_angle_rad,
+            first_lower,
+            first_upper,
+        )
+        if first_joint_angle is None:
+            continue
+
+        joint_values = rest_joint_values.copy()
+        joint_values[first_joint_index] = first_joint_angle
+        transform = _link_transform(
+            generated_graph,
+            tcp_link,
+            dict(zip(active_joint_order, joint_values)),
+        )
+        transverse_axis = 1 - axis_index
+        if abs(transform[transverse_axis][3]) > _CARDINAL_ALIGNMENT_TOLERANCE_M:
+            continue
+        signed_distance = direction_sign * transform[axis_index][3]
+        if signed_distance < 0.0:
+            continue
+        if signed_distance > best_distance + _DIRECTION_TIE_TOLERANCE_M:
+            best_distance = signed_distance
+            best_joint_values = joint_values
+
+    if best_joint_values is None:
+        raise SplitError(f"Could not compute the {selection.label} full-stretch pose.")
+
+    transform = _link_transform(
+        generated_graph,
+        tcp_link,
+        dict(zip(active_joint_order, best_joint_values)),
+    )
+    return {
+        "urdf_path": str(urdf_path.resolve()),
+        "tcp_link": tcp_link,
+        "active_joint_order": active_joint_order,
+        "full_stretch_joints": best_joint_values,
+        "full_stretch_xyz": [transform[index][3] for index in range(3)],
+        "full_stretch_quat": _canonical_xyzw_quaternion(transform),
+    }
+
+
+def _write_manifest(manifest: SplitManifest, destination: Path, *, force: bool) -> None:
+    """Write the per-arm sidecar manifest.
+
+    Args:
+        manifest: Left and right generated-model metadata.
+        destination: JSON sidecar path.
+        force: Whether an existing sidecar may be replaced.
+
+    Raises:
+        SplitError: If the destination exists without ``force``.
+        OSError: If the manifest cannot be written.
+    """
+
+    if destination.exists() and not force:
+        raise SplitError(
+            f"Refusing to overwrite {destination}; pass --force to replace it."
+        )
+    destination.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+
+
+def load_manifest(manifest_path: str | Path) -> SplitManifest:
+    """Load and minimally validate a generated split-URDF manifest.
+
+    Args:
+        manifest_path: JSON sidecar written by this module.
+
+    Returns:
+        Manifest with unchanged stored path strings and pose values.
+
+    Raises:
+        SplitError: If JSON structure, field shapes, or referenced URDF files
+            are invalid.
+    """
+
+    path = Path(manifest_path).expanduser().resolve()
+    try:
+        raw_manifest = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise SplitError(f"Could not read split-URDF manifest {path}: {exc}") from exc
+
+    if not isinstance(raw_manifest, dict) or set(raw_manifest) != {"left", "right"}:
+        raise SplitError("Split-URDF manifest must contain exactly left and right.")
+
+    for side in ("left", "right"):
+        entry = raw_manifest[side]
+        if not isinstance(entry, dict) or set(entry) != _MANIFEST_ENTRY_FIELDS:
+            raise SplitError(
+                f"Manifest entry {side!r} must contain exactly "
+                f"{sorted(_MANIFEST_ENTRY_FIELDS)}."
+            )
+        if not isinstance(entry["urdf_path"], str) or not isinstance(
+            entry["tcp_link"], str
+        ):
+            raise SplitError(f"Manifest entry {side!r} has invalid path or TCP link.")
+        joint_order = entry["active_joint_order"]
+        joint_values = entry["full_stretch_joints"]
+        xyz = entry["full_stretch_xyz"]
+        quaternion = entry["full_stretch_quat"]
+        if not isinstance(joint_order, list) or not all(
+            isinstance(name, str) for name in joint_order
+        ):
+            raise SplitError(f"Manifest entry {side!r} has invalid joint order.")
+        numeric_vectors = (joint_values, xyz, quaternion)
+        if not all(
+            isinstance(vector, list)
+            and all(
+                isinstance(value, (int, float)) and not isinstance(value, bool)
+                for value in vector
+            )
+            for vector in numeric_vectors
+        ):
+            raise SplitError(f"Manifest entry {side!r} has invalid pose values.")
+        if (
+            len(joint_values) != len(joint_order)
+            or len(xyz) != 3
+            or len(quaternion) != 4
+        ):
+            raise SplitError(f"Manifest entry {side!r} has invalid pose dimensions.")
+        urdf_path = Path(entry["urdf_path"]).expanduser()
+        if not urdf_path.is_absolute():
+            urdf_path = path.parent / urdf_path
+        if not urdf_path.is_file():
+            raise SplitError(
+                f"Manifest entry {side!r} references missing URDF {urdf_path}."
+            )
+
+    return cast(SplitManifest, raw_manifest)
 
 
 def _prompt_joint(value: str | None, prompt: str) -> str:
-    """Return a supplied joint name or obtain it interactively for the CLI."""
-
     if value:
         return value
     if not sys.stdin.isatty():
@@ -1228,113 +1214,401 @@ def _prompt_joint(value: str | None, prompt: str) -> str:
     return entered
 
 
-def _print_summary(arm: GeneratedArm, output: Path) -> None:
-    """Print a concise CLI summary for one generated arm."""
-
-    selection = arm.selection
+def _print_summary(
+    selection: ArmSelection,
+    frozen: list[str],
+    removed_transmissions: list[str],
+    output: Path,
+    graph: UrdfGraph,
+) -> None:
+    ignored_on_path = [
+        name for name in selection.path if graph.joints[name].get("type") != "revolute"
+    ]
     print(f"\n{selection.label.capitalize()} output: {output}")
     print(f"  First actuator frame: {selection.first_joint}")
     print("  First actuator axis: parallel to world Z (positive direction -Z)")
     print(
-        f"  Active joints ({len(selection.active_joints)}): "
+        f"  Active/addressable joints ({len(selection.active_joints)}): "
         + (", ".join(selection.active_joints) or "none")
     )
     print(
-        f"  Frozen at URDF q=0 ({len(arm.frozen_joints)}): "
-        + (", ".join(arm.frozen_joints) or "none")
+        f"  Frozen formerly movable joints ({len(frozen)}): "
+        + (", ".join(frozen) or "none")
     )
-    if arm.removed_transmissions:
+    if ignored_on_path:
+        print(
+            "  Non-revolute path joints retained as fixed: "
+            + ", ".join(ignored_on_path)
+        )
+    if removed_transmissions:
         print(
             "  Removed transmissions for frozen joints: "
-            + ", ".join(arm.removed_transmissions)
+            + ", ".join(removed_transmissions)
         )
 
 
-def _parse_package_root_args(values: list[str]) -> dict[str, Path]:
-    """Parse repeatable CLI package-root bindings in PACKAGE=PATH form."""
+def _add_viser_joint_controls(server: object, robot: object, label: str) -> None:
+    """Add degree-valued joint sliders for one Viser URDF.
 
-    package_roots: dict[str, Path] = {}
-    for value in values:
-        package_name, separator, root_text = value.partition("=")
-        package_name = package_name.strip()
-        root_text = root_text.strip()
-        if not separator or not package_name or not root_text:
-            raise SplitError(
-                f"Invalid --package-root {value!r}; expected PACKAGE=PATH."
+    Viser is an optional dependency, so the parameters intentionally use
+    ``object`` rather than importing its runtime-only handle types globally.
+    """
+
+    gui = server.gui  # type: ignore[attr-defined]
+    joint_names = robot.get_actuated_joint_names()  # type: ignore[attr-defined]
+    joint_limits = robot.get_actuated_joint_limits()  # type: ignore[attr-defined]
+    sliders: list[object] = []
+    initial_values_deg: list[float] = []
+
+    with gui.add_folder(f"{label.capitalize()} arm joints"):
+        for joint_name in joint_names:
+            lower_rad, upper_rad = joint_limits[joint_name]
+            lower_rad = (
+                -math.pi
+                if lower_rad is None or not math.isfinite(lower_rad)
+                else float(lower_rad)
             )
-        if package_name in package_roots:
-            raise SplitError(
-                f"Package root for {package_name!r} was provided more than once."
+            upper_rad = (
+                math.pi
+                if upper_rad is None or not math.isfinite(upper_rad)
+                else float(upper_rad)
             )
-        package_roots[package_name] = Path(root_text)
-    return package_roots
+            if lower_rad >= upper_rad:
+                lower_rad, upper_rad = -math.pi, math.pi
+            initial_rad = min(max(0.0, lower_rad), upper_rad)
+            initial_deg = math.degrees(initial_rad)
+            initial_values_deg.append(initial_deg)
+            sliders.append(
+                gui.add_slider(
+                    label=f"{joint_name} [deg]",
+                    min=math.degrees(lower_rad),
+                    max=math.degrees(upper_rad),
+                    step=1.0,
+                    initial_value=initial_deg,
+                )
+            )
+        reset_button = gui.add_button(f"Reset {label} arm")
 
-
-def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
-    """Parse the production split command without draft compatibility modes."""
-
-    parser = argparse.ArgumentParser(
-        description=(
-            "Validate a bimanual URDF and generate one complete-geometry URDF "
-            "per arm."
+    def update_robot(_: object | None = None) -> None:
+        robot.update_cfg(  # type: ignore[attr-defined]
+            [math.radians(float(slider.value)) for slider in sliders]  # type: ignore[attr-defined]
         )
-    )
+
+    for slider in sliders:
+        slider.on_update(update_robot)  # type: ignore[attr-defined]
+
+    def reset_robot(_: object) -> None:
+        for slider, initial_value in zip(sliders, initial_values_deg):
+            slider.value = initial_value  # type: ignore[attr-defined]
+        update_robot()
+
+    reset_button.on_click(reset_robot)
+    update_robot()
+
+
+def simulate(
+    left_urdf: str | Path,
+    right_urdf: str | Path,
+    *,
+    port: int = 8080,
+) -> None:
+    """Display two existing split URDFs side-by-side until interrupted."""
+
+    if not 1 <= port <= 65535:
+        raise SplitError("Viser port must be between 1 and 65535.")
+
+    left_path = Path(left_urdf).expanduser().resolve()
+    right_path = Path(right_urdf).expanduser().resolve()
+    for label, path in (("left", left_path), ("right", right_path)):
+        if not path.is_file():
+            raise SplitError(
+                f"The {label} URDF does not exist or is not a file: {path}"
+            )
+
+    try:
+        import time
+
+        import viser
+        from viser.extras import ViserUrdf
+    except ImportError as exc:
+        raise SplitError(
+            "Simulation requires Viser URDF support; install it with "
+            "`python -m pip install 'viser[urdf]'`."
+        ) from exc
+
+    server = viser.ViserServer(host="127.0.0.1", port=port)
+    try:
+        server.initial_camera.position = (1.8, -2.4, 1.2)
+        server.initial_camera.look_at = (0.0, 0.0, -0.25)
+        server.scene.add_grid(
+            "/grid",
+            width=2.5,
+            height=2.5,
+            position=(0.0, 0.0, 0.0),
+        )
+        server.scene.add_frame(
+            "/left",
+            position=(0.0, 0.7, 0.0),
+            axes_length=0.12,
+            axes_radius=0.004,
+        )
+        server.scene.add_frame(
+            "/right",
+            position=(0.0, -0.7, 0.0),
+            axes_length=0.12,
+            axes_radius=0.004,
+        )
+        server.scene.add_label(
+            "/left/label",
+            "Left-arm output",
+            position=(0.0, 0.0, 0.18),
+        )
+        server.scene.add_label(
+            "/right/label",
+            "Right-arm output",
+            position=(0.0, 0.0, 0.18),
+        )
+
+        left_robot = ViserUrdf(
+            server,
+            urdf_or_path=left_path,
+            root_node_name="/left/robot",
+            mesh_color_override=(0.45, 0.65, 1.0, 0.55),
+            collision_mesh_color_override=(1.0, 0.25, 0.05, 0.35),
+            load_meshes=True,
+            load_collision_meshes=True,
+        )
+        right_robot = ViserUrdf(
+            server,
+            urdf_or_path=right_path,
+            root_node_name="/right/robot",
+            mesh_color_override=(0.45, 0.9, 0.6, 0.55),
+            collision_mesh_color_override=(1.0, 0.25, 0.05, 0.35),
+            load_meshes=True,
+            load_collision_meshes=True,
+        )
+        robots = (left_robot, right_robot)
+        for robot in robots:
+            robot.show_visual = True
+            robot.show_collision = False
+
+        visual_toggle = server.gui.add_checkbox(
+            "Show visual geometry", initial_value=True
+        )
+        collision_toggle = server.gui.add_checkbox(
+            "Show collision geometry", initial_value=False
+        )
+
+        def update_geometry_visibility(_: object) -> None:
+            for robot in robots:
+                robot.show_visual = bool(visual_toggle.value)
+                robot.show_collision = bool(collision_toggle.value)
+
+        visual_toggle.on_update(update_geometry_visibility)
+        collision_toggle.on_update(update_geometry_visibility)
+        _add_viser_joint_controls(server, left_robot, "left")
+        _add_viser_joint_controls(server, right_robot, "right")
+
+        print(f"\nViser viewer: http://127.0.0.1:{port}")
+        print("The selected models are shown side-by-side. Press Ctrl+C to close.")
+        while True:
+            time.sleep(0.25)
+    except KeyboardInterrupt:
+        print("\nViser viewer closed.")
+    except Exception as exc:
+        raise SplitError(f"Could not start the Viser viewer: {exc}") from exc
+    finally:
+        server.stop()
+
+
+def _default_output(source: Path, label: str) -> Path:
+    return source.with_name(f"{source.stem}-{label}{source.suffix}")
+
+
+def _add_split_arguments(parser: argparse.ArgumentParser) -> None:
+    """Add arguments used only when generating split URDFs.
+
+    Args:
+        parser: Split subcommand parser to configure.
+    """
+
     parser.add_argument("urdf", type=Path, help="Source bimanual URDF.")
-    parser.add_argument("--left-first-joint", help="First left-arm actuator joint.")
-    parser.add_argument("--right-first-joint", help="First right-arm actuator joint.")
+    parser.add_argument(
+        "--left-first-joint",
+        help="First actuator joint of the left arm.",
+    )
+    parser.add_argument(
+        "--right-first-joint",
+        help="First actuator joint of the right arm.",
+    )
     parser.add_argument(
         "--left-end-joint",
-        help="Last left-arm joint; required when its selected subtree branches.",
+        help=(
+            "Last left-arm joint; required non-interactively if its subtree "
+            "branches."
+        ),
     )
     parser.add_argument(
         "--right-end-joint",
-        help="Last right-arm joint; required when its selected subtree branches.",
+        help=(
+            "Last right-arm joint; required non-interactively if its subtree "
+            "branches."
+        ),
     )
     parser.add_argument("--left-output", type=Path, help="Left output URDF path.")
     parser.add_argument("--right-output", type=Path, help="Right output URDF path.")
     parser.add_argument(
-        "--package-root",
-        action="append",
-        default=[],
-        metavar="PACKAGE=PATH",
-        help=(
-            "Bind a package:// name to a package root. Repeat for multiple "
-            "packages; unambiguous source-adjacent layouts are inferred."
-        ),
+        "--force",
+        action="store_true",
+        help="Overwrite existing output URDFs and sidecar manifest.",
     )
     parser.add_argument(
-        "--force", action="store_true", help="Overwrite existing output files."
+        "--visualize",
+        "--viser",
+        action="store_true",
+        help="Open both generated URDFs side-by-side in Viser after writing them.",
     )
-    return parser.parse_args(argv)
+    parser.add_argument(
+        "--viser-port",
+        type=int,
+        default=8080,
+        help="Port for --visualize (default: %(default)s).",
+    )
+
+
+def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    raw_args = list(sys.argv[1:] if argv is None else argv)
+    commands = {"split", "simulate"}
+    if raw_args and raw_args[0] not in commands | {"-h", "--help"}:
+        # Preserve the original `script.py SOURCE ...` split invocation.
+        raw_args.insert(0, "split")
+
+    parser = argparse.ArgumentParser(
+        description="Split a bimanual URDF or view existing split URDFs."
+    )
+    subparsers = parser.add_subparsers(dest="command", required=True)
+    split_parser = subparsers.add_parser(
+        "split",
+        help="Generate one URDF per arm.",
+        description=(
+            "Generate one URDF per arm while retaining the complete robot as "
+            "visual and collision geometry."
+        ),
+    )
+    _add_split_arguments(split_parser)
+
+    simulate_parser = subparsers.add_parser(
+        "simulate",
+        help="View two existing split URDFs without regenerating them.",
+    )
+    simulate_parser.add_argument("left_urdf", type=Path, help="Left-arm URDF.")
+    simulate_parser.add_argument("right_urdf", type=Path, help="Right-arm URDF.")
+    simulate_parser.add_argument(
+        "--viser-port",
+        type=int,
+        default=8080,
+        help="Viser port (default: %(default)s).",
+    )
+    return parser.parse_args(raw_args)
 
 
 def main(argv: list[str] | None = None) -> int:
-    """Run the one-shot split CLI and return its process status."""
+    """Run the split or simulation command.
+
+    Args:
+        argv: Optional arguments excluding the Python executable and module.
+
+    Returns:
+        Zero after the requested command completes.
+
+    Raises:
+        SplitError: If validation, splitting, pose generation, or output fails.
+    """
 
     args = _parse_args(argv)
-    left_first_joint = _prompt_joint(
+    if args.command == "simulate":
+        simulate(args.left_urdf, args.right_urdf, port=args.viser_port)
+        return 0
+
+    source = args.urdf.resolve()
+    left_output = (args.left_output or _default_output(source, "left")).resolve()
+    right_output = (args.right_output or _default_output(source, "right")).resolve()
+    manifest_path = source.with_suffix(".json")
+    if left_output == right_output:
+        raise SplitError("Left and right output paths must be different.")
+    if source in {left_output, right_output}:
+        raise SplitError("An output path must not overwrite the source URDF.")
+    if manifest_path.exists() and not args.force:
+        raise SplitError(
+            f"Refusing to overwrite {manifest_path}; pass --force to replace it."
+        )
+
+    tree = _load_urdf(source)
+    graph = _build_graph(tree.getroot())
+    _validate_source_meshes(tree.getroot(), graph.root_link, source.parent)
+    left_first = _prompt_joint(
         args.left_first_joint, "First actuator joint of the left arm: "
     )
-    right_first_joint = _prompt_joint(
+    right_first = _prompt_joint(
         args.right_first_joint, "First actuator joint of the right arm: "
     )
-    package_roots = _parse_package_root_args(args.package_root)
-    result = split_urdf(
-        args.urdf,
-        left_first_joint=left_first_joint,
-        right_first_joint=right_first_joint,
-        left_end_joint=args.left_end_joint,
-        right_end_joint=args.right_end_joint,
-        package_roots=package_roots,
+    if left_first == right_first:
+        raise SplitError("Left and right first actuator joints must be different.")
+
+    left_selection = _resolve_arm_selection(
+        graph,
+        label="left",
+        first_joint_name=left_first,
+        end_joint_name=args.left_end_joint,
     )
-    left_output, right_output = write_split_urdfs(
-        result,
-        left_output=args.left_output,
-        right_output=args.right_output,
-        force=args.force,
+    right_selection = _resolve_arm_selection(
+        graph,
+        label="right",
+        first_joint_name=right_first,
+        end_joint_name=args.right_end_joint,
     )
-    _print_summary(result.left, left_output)
-    _print_summary(result.right, right_output)
+
+    left_tree, left_frozen, left_transmissions = _generate_arm_tree(
+        tree, graph, left_selection, source.parent
+    )
+    right_tree, right_frozen, right_transmissions = _generate_arm_tree(
+        tree, graph, right_selection, source.parent
+    )
+
+    if args.force and manifest_path.exists():
+        try:
+            manifest_path.unlink()
+        except OSError as exc:
+            raise SplitError(
+                f"Could not remove stale manifest {manifest_path}: {exc}"
+            ) from exc
+
+    _write_tree(left_tree, left_output, force=args.force)
+    try:
+        _write_tree(right_tree, right_output, force=args.force)
+    except Exception:
+        # Do not delete the successfully written left output: an existing file
+        # may have been overwritten intentionally with --force.  Report the
+        # partial result clearly instead.
+        print(
+            f"Left output was written before the right output failed: {left_output}",
+            file=sys.stderr,
+        )
+        raise
+
+    manifest: SplitManifest = {
+        "left": _compute_full_stretch(left_output, left_selection, graph),
+        "right": _compute_full_stretch(right_output, right_selection, graph),
+    }
+    _write_manifest(manifest, manifest_path, force=args.force)
+
+    _print_summary(left_selection, left_frozen, left_transmissions, left_output, graph)
+    _print_summary(
+        right_selection, right_frozen, right_transmissions, right_output, graph
+    )
+    print(f"\nManifest: {manifest_path}")
+    if args.visualize:
+        simulate(left_output, right_output, port=args.viser_port)
     return 0
 
 
